@@ -47,6 +47,7 @@ _standalone_send = _line._standalone_send
 _env_enablement = _line._env_enablement
 _MessageDeduplicator = _line._MessageDeduplicator
 _message_mentions_bot = _line._message_mentions_bot
+_apply_yaml_config = _line._apply_yaml_config
 
 
 # ---------------------------------------------------------------------------
@@ -176,6 +177,82 @@ class TestRequireMention:
         event = self._event()
         asyncio.run(adapter._dispatch_event(event))
         adapter._handle_message_event.assert_awaited_once_with(event)
+
+    def test_unmentioned_group_text_is_observed_without_dispatch(self, monkeypatch):
+        adapter = self._adapter(monkeypatch)
+        adapter.observe_unmentioned_group_messages = True
+        event = self._event(message={"id": "m1", "type": "text", "text": "earlier context"})
+
+        asyncio.run(adapter._dispatch_event(event))
+
+        adapter._handle_message_event.assert_not_awaited()
+        entries = adapter._observed_group_history.reserve("C-chat")
+        assert [entry.text for entry in entries] == ["earlier context"]
+
+    def test_next_mention_receives_observed_context(self, monkeypatch):
+        adapter = self._adapter(monkeypatch)
+        adapter.observe_unmentioned_group_messages = True
+        adapter.handle_message = AsyncMock()
+        # Exercise the real message handler for the trigger turn.
+        del adapter._handle_message_event
+        asyncio.run(adapter._dispatch_event(self._event(message={
+            "id": "ambient", "type": "text", "text": "we prefer option B"
+        })))
+        trigger = self._event(message={
+            "id": "trigger",
+            "type": "text",
+            "text": "@Hermes what do you think?",
+            "mention": {"mentionees": [{"type": "user", "isSelf": True}]},
+        })
+
+        asyncio.run(adapter._dispatch_event(trigger))
+
+        delivered = adapter.handle_message.await_args.args[0]
+        assert "we prefer option B" in delivered.channel_context
+        assert "not requests" in delivered.channel_context
+        assert adapter._observed_group_history.reserve("C-chat") == []
+
+    def test_unmentioned_group_image_is_cached_not_dispatched(self, monkeypatch):
+        adapter = self._adapter(monkeypatch)
+        adapter.observe_unmentioned_group_messages = True
+        adapter._download_media = AsyncMock(return_value=("/cache/photo.jpg", "image/jpeg"))
+        event = self._event(message={"id": "image-1", "type": "image"})
+
+        asyncio.run(adapter._dispatch_event(event))
+
+        adapter._handle_message_event.assert_not_awaited()
+        entries = adapter._observed_group_history.reserve("C-chat")
+        assert "/cache/photo.jpg" in entries[0].text
+
+    def test_failed_mention_turn_releases_observed_context(self, monkeypatch):
+        adapter = self._adapter(monkeypatch)
+        adapter.observe_unmentioned_group_messages = True
+        adapter.handle_message = AsyncMock(side_effect=RuntimeError("agent failed"))
+        del adapter._handle_message_event
+        asyncio.run(adapter._dispatch_event(self._event(message={
+            "id": "ambient", "type": "text", "text": "do not lose this"
+        })))
+        trigger = self._event(message={
+            "id": "trigger",
+            "type": "text",
+            "text": "@Hermes help",
+            "mention": {"mentionees": [{"type": "user", "isSelf": True}]},
+        })
+
+        with pytest.raises(RuntimeError, match="agent failed"):
+            asyncio.run(adapter._dispatch_event(trigger))
+
+        entries = adapter._observed_group_history.reserve("C-chat")
+        assert [entry.text for entry in entries] == ["do not lose this"]
+
+    def test_line_yaml_bridge_owns_observation_settings(self):
+        assert _apply_yaml_config({}, {
+            "observe_unmentioned_group_messages": True,
+            "observed_history_limit": 25,
+        }) == {
+            "observe_unmentioned_group_messages": True,
+            "observed_history_limit": 25,
+        }
 
 
 # ---------------------------------------------------------------------------
