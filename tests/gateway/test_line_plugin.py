@@ -46,6 +46,7 @@ validate_config = _line.validate_config
 _standalone_send = _line._standalone_send
 _env_enablement = _line._env_enablement
 _MessageDeduplicator = _line._MessageDeduplicator
+_message_mentions_bot = _line._message_mentions_bot
 
 
 # ---------------------------------------------------------------------------
@@ -103,6 +104,78 @@ class TestAllowlist:
     def test_user_in_allowlist_passes(self):
         src = {"type": "user", "userId": "Uok"}
         assert _allowed_for_source(src, allow_all=False, user_ids={"Uok"}, group_ids=set(), room_ids=set())
+
+
+class TestRequireMention:
+
+    @staticmethod
+    def _adapter(monkeypatch, *, require_mention=True):
+        monkeypatch.delenv("LINE_CHANNEL_ACCESS_TOKEN", raising=False)
+        monkeypatch.delenv("LINE_CHANNEL_SECRET", raising=False)
+        from gateway.config import PlatformConfig
+
+        adapter = LineAdapter(PlatformConfig(enabled=True, extra={
+            "channel_access_token": "tok",
+            "channel_secret": "sec",
+            "allow_all_users": True,
+            "require_mention": require_mention,
+        }))
+        adapter._handle_message_event = AsyncMock()
+        return adapter
+
+    @staticmethod
+    def _event(source_type="group", message=None):
+        source = {"type": source_type, "userId": "U-sender"}
+        source["groupId" if source_type == "group" else "roomId"] = "C-chat"
+        return {
+            "type": "message",
+            "source": source,
+            "message": message or {"id": "m1", "type": "text", "text": "hello"},
+        }
+
+    def test_structured_self_mention_is_recognized(self):
+        message = {
+            "mention": {"mentionees": [{"type": "user", "isSelf": True}]}
+        }
+        assert _message_mentions_bot(message)
+
+    def test_bot_user_id_fallback_is_recognized(self):
+        message = {
+            "mention": {"mentionees": [{"type": "user", "userId": "U-bot"}]}
+        }
+        assert _message_mentions_bot(message, "U-bot")
+
+    def test_unmentioned_group_message_is_ignored(self, monkeypatch):
+        adapter = self._adapter(monkeypatch)
+        asyncio.run(adapter._dispatch_event(self._event()))
+        adapter._handle_message_event.assert_not_awaited()
+
+    def test_mentioned_group_message_is_admitted(self, monkeypatch):
+        adapter = self._adapter(monkeypatch)
+        event = self._event(message={
+            "id": "m1",
+            "type": "text",
+            "text": "@Hermes hello",
+            "mention": {"mentionees": [{"type": "user", "isSelf": True}]},
+        })
+        asyncio.run(adapter._dispatch_event(event))
+        adapter._handle_message_event.assert_awaited_once_with(event)
+
+    def test_dm_is_not_gated(self, monkeypatch):
+        adapter = self._adapter(monkeypatch)
+        event = {
+            "type": "message",
+            "source": {"type": "user", "userId": "U-sender"},
+            "message": {"id": "m1", "type": "text", "text": "hello"},
+        }
+        asyncio.run(adapter._dispatch_event(event))
+        adapter._handle_message_event.assert_awaited_once_with(event)
+
+    def test_string_false_does_not_enable_gate(self, monkeypatch):
+        adapter = self._adapter(monkeypatch, require_mention="false")
+        event = self._event()
+        asyncio.run(adapter._dispatch_event(event))
+        adapter._handle_message_event.assert_awaited_once_with(event)
 
 
 # ---------------------------------------------------------------------------
@@ -506,4 +579,3 @@ class TestMediaPublicUrlGuard:
         result = asyncio.run(ad.send_image_file("Uchat", str(img)))
         assert not result.success
         assert "LINE_PUBLIC_URL" in (result.error or "")
-

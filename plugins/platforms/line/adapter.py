@@ -684,6 +684,35 @@ def _truthy_env(name: str, default: bool = False) -> bool:
     return v.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _config_bool(value: Any, default: bool = False) -> bool:
+    """Parse a boolean config value without treating ``"false"`` as true."""
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _message_mentions_bot(
+    message: Dict[str, Any], bot_user_id: Optional[str] = None
+) -> bool:
+    """Return whether a LINE text message explicitly mentions this bot.
+
+    LINE identifies mentions structurally under ``message.mention.mentionees``.
+    Bot mentions carry ``isSelf: true``; matching ``userId`` as well keeps the
+    gate usable with older webhook payloads that omit ``isSelf``.
+    """
+    mention = (message or {}).get("mention") or {}
+    for mentionee in mention.get("mentionees") or []:
+        if not isinstance(mentionee, dict) or mentionee.get("type") != "user":
+            continue
+        if mentionee.get("isSelf") is True:
+            return True
+        if bot_user_id and mentionee.get("userId") == bot_user_id:
+            return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Adapter
 # ---------------------------------------------------------------------------
@@ -745,6 +774,9 @@ class LineAdapter(BasePlatformAdapter):
         self.allowed_rooms = _csv_set(
             os.getenv("LINE_ALLOWED_ROOMS", "")
         ) | set(extra.get("allowed_rooms", []))
+        # In groups/rooms, optionally admit only messages that structurally
+        # mention this LINE bot. DMs are always unaffected.
+        self.require_mention = _config_bool(extra.get("require_mention"), False)
 
         # Slow-LLM postback button threshold
         try:
@@ -989,6 +1021,21 @@ class LineAdapter(BasePlatformAdapter):
             room_ids=self.allowed_rooms,
         ):
             logger.info("LINE: rejecting unauthorized source %s", source)
+            return
+
+        # LINE includes authoritative mention metadata in text-message
+        # webhooks. Gate only conversational messages: postback buttons and
+        # lifecycle events must keep working even in mention-only groups.
+        if (
+            event_type == "message"
+            and source.get("type") in {"group", "room"}
+            and self.require_mention
+            and not _message_mentions_bot(event.get("message") or {}, self._bot_user_id)
+        ):
+            logger.debug(
+                "LINE: ignoring group/room message "
+                "(require_mention=true, bot not mentioned)"
+            )
             return
 
         if event_type == "message":
