@@ -110,6 +110,12 @@ class PlatformEntry:
     # Do not use markdown.").  Empty string = no hint.
     platform_hint: str = ""
 
+    # Optional dashboard-editable behavioral config. Each entry declares a
+    # top-level ``<platform>.<key>`` field with ``type`` (boolean/integer),
+    # label, description, and optional min/max bounds. Kept generic so plugin
+    # platforms can expose config.yaml settings without core special-cases.
+    config_fields: tuple[dict, ...] = ()
+
     # ── Env-driven auto-configuration ──
     # Optional: read env vars, return a dict of ``PlatformConfig.extra`` fields
     # to seed when the platform is auto-enabled.  Called during

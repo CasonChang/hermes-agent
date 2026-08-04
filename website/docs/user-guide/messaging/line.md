@@ -17,8 +17,8 @@ LINE is the dominant messaging app in Japan, Taiwan, and Thailand. If your users
 | Context | Behavior |
 |---------|----------|
 | **1:1 chat** (`U` IDs) | Responds to every message |
-| **Group chat** (`C` IDs) | Responds when the group is on the allowlist |
-| **Multi-user room** (`R` IDs) | Responds when the room is on the allowlist |
+| **Group chat** (`C` IDs) | Responds when the group is on the allowlist; optionally only when tagged |
+| **Multi-user room** (`R` IDs) | Responds when the room is on the allowlist; optionally only when tagged |
 
 Inbound text, images, audio, video, files, stickers, and locations are all handled. Outbound text uses the **free reply token first** (single-use, ~60s window) and falls back to the metered Push API when the token has expired.
 
@@ -73,16 +73,32 @@ LINE_ALLOWED_ROOMS=R1234567890abcdef...           # optional room IDs
 LINE_PUBLIC_URL=https://my-tunnel.example.com
 ```
 
-Then in `~/.hermes/config.yaml`:
+Then in `~/.hermes/config.yaml`. Keep behavioral settings in the dedicated
+top-level `line:` block, matching Telegram's configuration style:
 
 ```yaml
-gateway:
-  platforms:
-    line:
-      enabled: true
+platforms:
+  line:
+    enabled: true
+
+line:
+  # In groups and rooms, respond only when the bot is @mentioned.
+  require_mention: true
+  # Keep authorized chatter/media as context without replying until tagged.
+  observe_unmentioned_group_messages: true
+  # Bounded independently for every group/room (range: 1-200).
+  observed_history_limit: 50
 ```
 
 That's enough — the bundled-plugin scan in `gateway/config.py` automatically picks up `plugins/platforms/line/`. No `Platform.LINE` enum edit, no `_create_adapter` registration.
+
+The LINE group/room allowlists (`LINE_ALLOWED_GROUPS` and `LINE_ALLOWED_ROOMS`)
+already authorize observation as well as replies. Unlike Telegram, LINE does
+not need duplicate `allowed_chats` and `group_allowed_chats` entries.
+
+These behavioral settings are also available under **Dashboard → Channels →
+LINE → Configure**. Saving them updates the top-level `line:` block and takes
+effect after the gateway restarts.
 
 ---
 

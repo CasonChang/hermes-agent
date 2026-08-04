@@ -28,6 +28,7 @@ import { useToast } from "@nous-research/ui/hooks/use-toast";
 import { api } from "@/lib/api";
 import type {
   MessagingPlatform,
+  MessagingPlatformConfigField,
   MessagingPlatformEnvVar,
   MessagingPlatformUpdate,
   TelegramOnboardingStartResponse,
@@ -142,6 +143,7 @@ export default function ChannelsPage() {
   // Config modal state
   const [editing, setEditing] = useState<MessagingPlatform | null>(null);
   const [draftEnv, setDraftEnv] = useState<Record<string, string>>({});
+  const [draftConfig, setDraftConfig] = useState<Record<string, boolean | number>>({});
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
   const [saving, setSaving] = useState(false);
   const closeEdit = useCallback(() => {
@@ -179,6 +181,9 @@ export default function ChannelsPage() {
       initial[v.key] = "";
     });
     setDraftEnv(initial);
+    setDraftConfig(
+      Object.fromEntries(platform.config_fields.map((field) => [field.key, field.value])),
+    );
     setFieldErrors({});
     setEditing(platform);
   };
@@ -191,7 +196,7 @@ export default function ChannelsPage() {
     Object.entries(draftEnv).forEach(([k, v]) => {
       if (v.trim()) env[k] = v.trim();
     });
-    if (Object.keys(env).length === 0) {
+    if (Object.keys(env).length === 0 && editing.config_fields.length === 0) {
       showToast("Nothing to save — fill in at least one field.", "error");
       return;
     }
@@ -214,7 +219,11 @@ export default function ChannelsPage() {
     }
     setSaving(true);
     try {
-      const body: MessagingPlatformUpdate = { env, enabled: true };
+      const body: MessagingPlatformUpdate = {
+        env,
+        config: draftConfig,
+        enabled: true,
+      };
       await api.updateMessagingPlatform(editing.id, body);
       showToast(`${editing.name} saved`, "success");
       setEditing(null);
@@ -500,6 +509,58 @@ export default function ChannelsPage() {
                   )}
                 </div>
               ))}
+
+              {editing.config_fields.length > 0 && (
+                <div className="grid gap-3 border-t border-border pt-4">
+                  <span className="text-xs font-medium uppercase tracking-[0.12em] text-foreground">
+                    Behavior
+                  </span>
+                  {editing.config_fields.map((field: MessagingPlatformConfigField) => (
+                    <div className="grid gap-1.5" key={field.key}>
+                      {field.type === "boolean" ? (
+                        <div className="flex items-start justify-between gap-4">
+                          <div className="grid gap-1">
+                            <Label htmlFor={`config-${field.key}`}>{field.label}</Label>
+                            <span className="text-xs text-muted-foreground">
+                              {field.description}
+                            </span>
+                          </div>
+                          <Switch
+                            id={`config-${field.key}`}
+                            checked={Boolean(draftConfig[field.key])}
+                            onCheckedChange={(checked) =>
+                              setDraftConfig((previous) => ({
+                                ...previous,
+                                [field.key]: checked,
+                              }))
+                            }
+                          />
+                        </div>
+                      ) : (
+                        <>
+                          <Label htmlFor={`config-${field.key}`}>{field.label}</Label>
+                          <span className="text-xs text-muted-foreground">
+                            {field.description}
+                          </span>
+                          <Input
+                            id={`config-${field.key}`}
+                            type="number"
+                            min={field.min}
+                            max={field.max}
+                            value={Number(draftConfig[field.key] ?? field.default)}
+                            onChange={(event) =>
+                              setDraftConfig((previous) => ({
+                                ...previous,
+                                [field.key]: Number(event.target.value),
+                              }))
+                            }
+                          />
+                        </>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
 
               <div className="flex flex-col-reverse gap-2 pt-1 sm:flex-row sm:justify-end">
                 <Button
