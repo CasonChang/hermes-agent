@@ -17,8 +17,8 @@ LINE is the dominant messaging app in Japan, Taiwan, and Thailand. If your users
 | Context | Behavior |
 |---------|----------|
 | **1:1 chat** (`U` IDs) | Responds to every message |
-| **Group chat** (`C` IDs) | Responds when the group is on the allowlist |
-| **Multi-user room** (`R` IDs) | Responds when the room is on the allowlist |
+| **Group chat** (`C` IDs) | Responds when the group is on the allowlist; optionally only when tagged |
+| **Multi-user room** (`R` IDs) | Responds when the room is on the allowlist; optionally only when tagged |
 
 Inbound text, images, audio, video, files, stickers, and locations are all handled. Outbound text uses the **free reply token first** (single-use, ~60s window) and falls back to the metered Push API when the token has expired.
 
@@ -80,6 +80,9 @@ gateway:
   platforms:
     line:
       enabled: true
+      # Optional: in groups and rooms, respond only when the bot is @mentioned.
+      # Direct messages continue to work normally.
+      require_mention: true
 ```
 
 That's enough — the bundled-plugin scan in `gateway/config.py` automatically picks up `plugins/platforms/line/`. No `Platform.LINE` enum edit, no `_create_adapter` registration.
