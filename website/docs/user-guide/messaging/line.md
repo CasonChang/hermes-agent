@@ -17,8 +17,8 @@ LINE is the dominant messaging app in Japan, Taiwan, and Thailand. If your users
 | Context | Behavior |
 |---------|----------|
 | **1:1 chat** (`U` IDs) | Responds to every message |
-| **Group chat** (`C` IDs) | Responds when the group is on the allowlist |
-| **Multi-user room** (`R` IDs) | Responds when the room is on the allowlist |
+| **Group chat** (`C` IDs) | Responds when the group is on the allowlist; optionally only when tagged |
+| **Multi-user room** (`R` IDs) | Responds when the room is on the allowlist; optionally only when tagged |
 
 Inbound text, images, audio, video, files, stickers, and locations are all handled. Outbound text uses the **free reply token first** (single-use, ~60s window) and falls back to the metered Push API when the token has expired.
 
@@ -73,16 +73,48 @@ LINE_ALLOWED_ROOMS=R1234567890abcdef...           # optional room IDs
 LINE_PUBLIC_URL=https://my-tunnel.example.com
 ```
 
-Then in `~/.hermes/config.yaml`:
+Then in `~/.hermes/config.yaml`. Keep behavioral settings in the dedicated
+top-level `line:` block, matching Telegram's configuration style:
 
 ```yaml
-gateway:
-  platforms:
-    line:
-      enabled: true
+platforms:
+  line:
+    enabled: true
+
+line:
+  # In groups and rooms, respond only when the bot is @mentioned.
+  require_mention: true
+  # Optional per-chat overrides. C... values are groups; R... values are rooms.
+  free_response_chats:
+    - C_group_that_can_talk_without_mentions
+  require_mention_chats:
+    - C_group_that_should_always_tag_the_bot
+  # Keep authorized chatter/media as context without replying until tagged.
+  observe_unmentioned_group_messages: true
+  # Bounded independently for every group/room (range: 1-200).
+  observed_history_limit: 50
+  # In mention-only groups, these media types can dispatch without @mention.
+  # Useful because LINE cannot tag someone while sending media. Supported:
+  # image, video, audio, file, sticker, location.
+  reply_without_mention_media_types:
+    - image
+    - video
 ```
 
 That's enough — the bundled-plugin scan in `gateway/config.py` automatically picks up `plugins/platforms/line/`. No `Platform.LINE` enum edit, no `_create_adapter` registration.
+
+The LINE group/room allowlists (`LINE_ALLOWED_GROUPS` and `LINE_ALLOWED_ROOMS`)
+already authorize observation as well as replies. Unlike Telegram, LINE does
+not need duplicate `allowed_chats` and `group_allowed_chats` entries.
+
+Slash commands such as `/model`, `/new`, and `/help` bypass the mention gate
+in authorized LINE groups/rooms so you can operate the bot without tagging it
+first. If you do tag the bot before a command (for example `@Hermes /model`),
+Hermes strips the bot mention before handing the command to the gateway parser.
+
+These behavioral settings are also available under **Dashboard → Channels →
+LINE → Configure**. Saving them updates the top-level `line:` block and takes
+effect after the gateway restarts.
 
 ---
 
@@ -153,6 +185,18 @@ LINE_HOME_CHANNEL=Uxxxxxxxxxxxxxxxxxxxx     # default delivery target
 ```
 
 Cron jobs with `deliver: line` route to `LINE_HOME_CHANNEL`. The adapter ships a standalone Push-only sender so cron jobs work even when cron runs in a separate process from the gateway.
+
+## Reply vs Push usage
+
+The adapter prefers LINE's free Reply API whenever a fresh inbound event gives
+Hermes a reply token. Normal user-triggered responses, media replies, slow-LLM
+postback buttons, and postback-button taps all try `reply_message` first. The
+metered Push API is used only when no reply token is available (for example
+cron/home-channel delivery, startup/update/background notifications, `send_message`
+tool delivery to a LINE chat, or replies that finish after the reply token is
+expired/consumed), when a Reply API call is rejected and falls back to Push, or
+when more than five LINE message objects must be sent and the follow-up batch
+has no reply token.
 
 ---
 

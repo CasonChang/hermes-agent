@@ -8194,6 +8194,9 @@ def _build_catalog_entry(
         "docs_url": override.get("docs_url", ""),
         "env_vars": env_vars,
         "required_env": required_env,
+        "config_fields": list(
+            getattr(plugin_entry, "config_fields", ()) if plugin_entry is not None else ()
+        ),
     }
 
 
@@ -8389,7 +8392,23 @@ def _messaging_platform_payload(
         ),
         "home_channel": home_channel,
         "env_vars": env_vars,
+        "config_fields": [],
     }
+    try:
+        raw = load_config()
+        platform_values = raw.get(platform_id)
+        if not isinstance(platform_values, dict):
+            platform_values = {}
+        for field in entry.get("config_fields", ()):
+            item = dict(field)
+            item["value"] = platform_values.get(item.get("key"), item.get("default"))
+            payload["config_fields"].append(item)
+    except Exception:
+        _log.debug(
+            "could not load dashboard config fields for %s",
+            platform_id,
+            exc_info=True,
+        )
     if whatsapp_setup is not None:
         payload["whatsapp_setup"] = whatsapp_setup
     return payload
@@ -9386,18 +9405,70 @@ async def update_messaging_platform(
                     _validate_messaging_env_value(platform_id, key, trimmed)
                     save_env_value(key, trimmed)
 
+            declared_config = {
+                field.get("key"): field for field in entry.get("config_fields", ())
+            }
+            if set(body.config) - set(declared_config):
+                unknown = sorted(set(body.config) - set(declared_config))[0]
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{unknown} is not configurable for {entry['name']}",
+                )
+            if body.config:
+                config = load_config()
+                platform_section = config.setdefault(platform_id, {})
+                if not isinstance(platform_section, dict):
+                    platform_section = {}
+                    config[platform_id] = platform_section
+                for key, value in body.config.items():
+                    field = declared_config[key]
+                    field_type = field.get("type")
+                    if field_type == "boolean":
+                        if not isinstance(value, bool):
+                            raise HTTPException(
+                                status_code=400,
+                                detail=f"{key} must be boolean",
+                            )
+                    elif field_type == "integer":
+                        if isinstance(value, bool) or not isinstance(value, int):
+                            raise HTTPException(
+                                status_code=400,
+                                detail=f"{key} must be an integer",
+                            )
+                        minimum = field.get("min")
+                        maximum = field.get("max")
+                        if minimum is not None and value < minimum:
+                            raise HTTPException(
+                                status_code=400,
+                                detail=f"{key} must be at least {minimum}",
+                            )
+                        if maximum is not None and value > maximum:
+                            raise HTTPException(
+                                status_code=400,
+                                detail=f"{key} must be at most {maximum}",
+                            )
+                    elif field_type == "string":
+                        if not isinstance(value, str):
+                            raise HTTPException(
+                                status_code=400,
+                                detail=f"{key} must be a string",
+                            )
+                    platform_section[key] = value
+                save_config(config)
+
             if body.enabled is not None:
                 _write_platform_enabled(platform_id, body.enabled)
 
         # Audit trail for channel config mutations: names only, never values.
         _log.info(
             "Messaging platform updated: platform=%s profile=%s enabled=%s "
-            "env_keys=%s cleared_keys=%s",
+            "env_keys=%s cleared_keys=%s config_keys=%s",
             platform_id,
             target_profile or "current",
             body.enabled,
             sorted(body.env),
             sorted(body.clear_env),
+            sorted(body.config),
         )
         return {"ok": True, "platform": platform_id}
     except HTTPException:

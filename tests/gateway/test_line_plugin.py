@@ -46,6 +46,9 @@ validate_config = _line.validate_config
 _standalone_send = _line._standalone_send
 _env_enablement = _line._env_enablement
 _MessageDeduplicator = _line._MessageDeduplicator
+_message_mentions_bot = _line._message_mentions_bot
+_message_text_without_bot_mentions = _line._message_text_without_bot_mentions
+_apply_yaml_config = _line._apply_yaml_config
 
 
 # ---------------------------------------------------------------------------
@@ -103,6 +106,210 @@ class TestAllowlist:
     def test_user_in_allowlist_passes(self):
         src = {"type": "user", "userId": "Uok"}
         assert _allowed_for_source(src, allow_all=False, user_ids={"Uok"}, group_ids=set(), room_ids=set())
+
+
+class TestRequireMention:
+
+    @staticmethod
+    def _adapter(monkeypatch, *, require_mention=True):
+        monkeypatch.delenv("LINE_CHANNEL_ACCESS_TOKEN", raising=False)
+        monkeypatch.delenv("LINE_CHANNEL_SECRET", raising=False)
+        from gateway.config import PlatformConfig
+
+        adapter = LineAdapter(PlatformConfig(enabled=True, extra={
+            "channel_access_token": "tok",
+            "channel_secret": "sec",
+            "allow_all_users": True,
+            "require_mention": require_mention,
+        }))
+        adapter._handle_message_event = AsyncMock()
+        return adapter
+
+    @staticmethod
+    def _event(source_type="group", message=None):
+        source = {"type": source_type, "userId": "U-sender"}
+        source["groupId" if source_type == "group" else "roomId"] = "C-chat"
+        return {
+            "type": "message",
+            "source": source,
+            "message": message or {"id": "m1", "type": "text", "text": "hello"},
+        }
+
+    def test_structured_self_mention_is_recognized(self):
+        message = {
+            "mention": {"mentionees": [{"type": "user", "isSelf": True}]}
+        }
+        assert _message_mentions_bot(message)
+
+    def test_bot_user_id_fallback_is_recognized(self):
+        message = {
+            "mention": {"mentionees": [{"type": "user", "userId": "U-bot"}]}
+        }
+        assert _message_mentions_bot(message, "U-bot")
+
+    def test_unmentioned_group_message_is_ignored(self, monkeypatch):
+        adapter = self._adapter(monkeypatch)
+        asyncio.run(adapter._dispatch_event(self._event()))
+        adapter._handle_message_event.assert_not_awaited()
+
+    def test_mentioned_group_message_is_admitted(self, monkeypatch):
+        adapter = self._adapter(monkeypatch)
+        event = self._event(message={
+            "id": "m1",
+            "type": "text",
+            "text": "@Hermes hello",
+            "mention": {"mentionees": [{"type": "user", "isSelf": True}]},
+        })
+        asyncio.run(adapter._dispatch_event(event))
+        adapter._handle_message_event.assert_awaited_once_with(event)
+
+    def test_group_slash_command_bypasses_mention_gate(self, monkeypatch):
+        adapter = self._adapter(monkeypatch)
+        event = self._event(message={
+            "id": "m1",
+            "type": "text",
+            "text": "/model",
+        })
+
+        asyncio.run(adapter._dispatch_event(event))
+
+        adapter._handle_message_event.assert_awaited_once_with(event)
+
+    def test_mentioned_slash_command_strips_bot_mention(self):
+        message = {
+            "type": "text",
+            "text": "@Hermes /model",
+            "mention": {
+                "mentionees": [
+                    {"type": "user", "isSelf": True, "index": 0, "length": 7}
+                ]
+            },
+        }
+
+        assert _message_text_without_bot_mentions(message) == "/model"
+
+    def test_free_response_chat_overrides_global_require_mention(self, monkeypatch):
+        adapter = self._adapter(monkeypatch)
+        adapter.free_response_chats = {"C-chat"}
+
+        asyncio.run(adapter._dispatch_event(self._event()))
+
+        adapter._handle_message_event.assert_awaited_once()
+
+    def test_require_mention_chat_overrides_global_free_response(self, monkeypatch):
+        adapter = self._adapter(monkeypatch, require_mention=False)
+        adapter.require_mention_chats = {"C-chat"}
+
+        asyncio.run(adapter._dispatch_event(self._event()))
+
+        adapter._handle_message_event.assert_not_awaited()
+
+    def test_unmentioned_configured_media_type_is_admitted(self, monkeypatch):
+        adapter = self._adapter(monkeypatch)
+        adapter.reply_without_mention_media_types = {"image", "video"}
+        event = self._event(message={"id": "image-1", "type": "image"})
+
+        asyncio.run(adapter._dispatch_event(event))
+
+        adapter._handle_message_event.assert_awaited_once_with(event)
+
+    def test_dm_is_not_gated(self, monkeypatch):
+        adapter = self._adapter(monkeypatch)
+        event = {
+            "type": "message",
+            "source": {"type": "user", "userId": "U-sender"},
+            "message": {"id": "m1", "type": "text", "text": "hello"},
+        }
+        asyncio.run(adapter._dispatch_event(event))
+        adapter._handle_message_event.assert_awaited_once_with(event)
+
+    def test_string_false_does_not_enable_gate(self, monkeypatch):
+        adapter = self._adapter(monkeypatch, require_mention="false")
+        event = self._event()
+        asyncio.run(adapter._dispatch_event(event))
+        adapter._handle_message_event.assert_awaited_once_with(event)
+
+    def test_unmentioned_group_text_is_observed_without_dispatch(self, monkeypatch):
+        adapter = self._adapter(monkeypatch)
+        adapter.observe_unmentioned_group_messages = True
+        event = self._event(message={"id": "m1", "type": "text", "text": "earlier context"})
+
+        asyncio.run(adapter._dispatch_event(event))
+
+        adapter._handle_message_event.assert_not_awaited()
+        entries = adapter._observed_group_history.reserve("C-chat")
+        assert [entry.text for entry in entries] == ["earlier context"]
+
+    def test_next_mention_receives_observed_context(self, monkeypatch):
+        adapter = self._adapter(monkeypatch)
+        adapter.observe_unmentioned_group_messages = True
+        adapter.handle_message = AsyncMock()
+        # Exercise the real message handler for the trigger turn.
+        del adapter._handle_message_event
+        asyncio.run(adapter._dispatch_event(self._event(message={
+            "id": "ambient", "type": "text", "text": "we prefer option B"
+        })))
+        trigger = self._event(message={
+            "id": "trigger",
+            "type": "text",
+            "text": "@Hermes what do you think?",
+            "mention": {"mentionees": [{"type": "user", "isSelf": True}]},
+        })
+
+        asyncio.run(adapter._dispatch_event(trigger))
+
+        delivered = adapter.handle_message.await_args.args[0]
+        assert "we prefer option B" in delivered.channel_context
+        assert "not requests" in delivered.channel_context
+        assert adapter._observed_group_history.reserve("C-chat") == []
+
+    def test_unmentioned_group_image_is_cached_not_dispatched(self, monkeypatch):
+        adapter = self._adapter(monkeypatch)
+        adapter.observe_unmentioned_group_messages = True
+        adapter._download_media = AsyncMock(return_value=("/cache/photo.jpg", "image/jpeg"))
+        event = self._event(message={"id": "image-1", "type": "image"})
+
+        asyncio.run(adapter._dispatch_event(event))
+
+        adapter._handle_message_event.assert_not_awaited()
+        entries = adapter._observed_group_history.reserve("C-chat")
+        assert "/cache/photo.jpg" in entries[0].text
+
+    def test_failed_mention_turn_releases_observed_context(self, monkeypatch):
+        adapter = self._adapter(monkeypatch)
+        adapter.observe_unmentioned_group_messages = True
+        adapter.handle_message = AsyncMock(side_effect=RuntimeError("agent failed"))
+        del adapter._handle_message_event
+        asyncio.run(adapter._dispatch_event(self._event(message={
+            "id": "ambient", "type": "text", "text": "do not lose this"
+        })))
+        trigger = self._event(message={
+            "id": "trigger",
+            "type": "text",
+            "text": "@Hermes help",
+            "mention": {"mentionees": [{"type": "user", "isSelf": True}]},
+        })
+
+        with pytest.raises(RuntimeError, match="agent failed"):
+            asyncio.run(adapter._dispatch_event(trigger))
+
+        entries = adapter._observed_group_history.reserve("C-chat")
+        assert [entry.text for entry in entries] == ["do not lose this"]
+
+    def test_line_yaml_bridge_owns_observation_settings(self):
+        assert _apply_yaml_config({}, {
+            "observe_unmentioned_group_messages": True,
+            "observed_history_limit": 25,
+            "free_response_chats": ["C-open"],
+            "require_mention_chats": ["C-quiet"],
+            "reply_without_mention_media_types": ["image", "video"],
+        }) == {
+            "observe_unmentioned_group_messages": True,
+            "observed_history_limit": 25,
+            "free_response_chats": ["C-open"],
+            "require_mention_chats": ["C-quiet"],
+            "reply_without_mention_media_types": ["image", "video"],
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -506,4 +713,3 @@ class TestMediaPublicUrlGuard:
         result = asyncio.run(ad.send_image_file("Uchat", str(img)))
         assert not result.success
         assert "LINE_PUBLIC_URL" in (result.error or "")
-

@@ -66,6 +66,10 @@ def _env_field(platform, key):
     return next(f for f in platform["env_vars"] if f["key"] == key)
 
 
+def _platform(payload, platform_id):
+    return next(p for p in payload["platforms"] if p["id"] == platform_id)
+
+
 class TestProfileScopedMessagingReads:
     def test_scoped_read_does_not_show_root_credentials(
         self, client, isolated_profiles
@@ -86,6 +90,54 @@ class TestProfileScopedMessagingReads:
             "/api/messaging/platforms", params={"profile": "no_such_profile"}
         )
         assert resp.status_code == 404
+
+    def test_line_behavior_fields_round_trip_in_profile_config(
+        self, client, isolated_profiles
+    ):
+        response = client.put(
+            "/api/messaging/platforms/line",
+            json={
+                "profile": "worker_alpha",
+                "config": {
+                    "require_mention": True,
+                    "observe_unmentioned_group_messages": True,
+                    "observed_history_limit": 25,
+                    "free_response_chats": "C-open",
+                    "require_mention_chats": "C-quiet",
+                    "reply_without_mention_media_types": "image,video",
+                },
+            },
+        )
+        assert response.status_code == 200, response.text
+
+        saved = yaml.safe_load(
+            (isolated_profiles["worker_alpha"] / "config.yaml").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert saved["line"] == {
+            "require_mention": True,
+            "observe_unmentioned_group_messages": True,
+            "observed_history_limit": 25,
+            "free_response_chats": "C-open",
+            "require_mention_chats": "C-quiet",
+            "reply_without_mention_media_types": "image,video",
+        }
+        assert "line" not in (saved.get("platforms") or {})
+
+        payload = client.get(
+            "/api/messaging/platforms", params={"profile": "worker_alpha"}
+        ).json()
+        line = _platform(payload, "line")
+        values = {field["key"]: field["value"] for field in line["config_fields"]}
+        assert values == {
+            "require_mention": True,
+            "observe_unmentioned_group_messages": True,
+            "observed_history_limit": 25,
+            "free_response_chats": "C-open",
+            "require_mention_chats": "C-quiet",
+            "reply_without_mention_media_types": "image,video",
+        }
 
     def test_scoped_read_returns_profile_path_command_and_startup_failure(
         self, client, isolated_profiles, monkeypatch
@@ -266,4 +318,3 @@ class TestMultiplexPortBindingGuard:
                 json={"clear_env": [api_server["env_vars"][0]["key"]]},
             )
             assert resp.status_code == 200
-
