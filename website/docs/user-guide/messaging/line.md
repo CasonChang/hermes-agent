@@ -214,6 +214,14 @@ expired/consumed), when a Reply API call is rejected and falls back to Push, or
 when more than five LINE message objects must be sent and the follow-up batch
 has no reply token.
 
+The gateway log records the outbound route explicitly as `Reply API`,
+`metered Push API`, or `cached response behind slow-response button`. A
+slow-response button is turn-scoped: if a newer inbound message arrives before
+the button is tapped, LINE detaches the old button from new delivery routing.
+An old READY answer remains retrievable from its button; an old still-PENDING
+request reports that it was replaced. This prevents a later tagged answer from
+silently being cached behind an earlier image turn's button.
+
 By default, LINE groups/rooms suppress the gateway's session-reset and
 missing-home-channel setup notices as well as delayed self-improvement review
 summaries. Suppression happens before the reply token

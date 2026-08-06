@@ -475,6 +475,40 @@ class TestInboundMedia:
         assert event.media_urls == ["/cache/image.jpg"]
         assert event.media_types == ["image/jpeg"]
 
+    def test_new_inbound_detaches_and_resolves_stale_pending_button(self, adapter):
+        rid = adapter._cache.register_pending("Cline")
+        adapter._pending_buttons["Cline"] = rid
+
+        asyncio.run(adapter._handle_message_event({
+            "type": "message",
+            "replyToken": "new-reply-token",
+            "source": {"type": "group", "groupId": "Cline", "userId": "Uline"},
+            "message": {"id": "text-1", "type": "text", "text": "壞掉了"},
+        }))
+
+        assert "Cline" not in adapter._pending_buttons
+        entry = adapter._cache.get(rid)
+        assert entry.state is State.ERROR
+        assert "newer message" in entry.payload
+        adapter.handle_message.assert_awaited_once()
+
+    def test_new_inbound_keeps_ready_old_button_retrievable(self, adapter):
+        rid = adapter._cache.register_pending("Cline")
+        adapter._cache.set_ready(rid, "old answer")
+        adapter._pending_buttons["Cline"] = rid
+
+        asyncio.run(adapter._handle_message_event({
+            "type": "message",
+            "replyToken": "new-reply-token",
+            "source": {"type": "group", "groupId": "Cline", "userId": "Uline"},
+            "message": {"id": "text-2", "type": "text", "text": "new question"},
+        }))
+
+        assert "Cline" not in adapter._pending_buttons
+        entry = adapter._cache.get(rid)
+        assert entry.state is State.READY
+        assert entry.payload == "old answer"
+
 
 # ---------------------------------------------------------------------------
 # 8. Send routing (reply -> push fallback, batching, system-bypass)

@@ -1297,6 +1297,28 @@ class LineAdapter(BasePlatformAdapter):
         chat_id, chat_type = _resolve_chat(source)
         user_id = source.get("userId", "") or chat_id
 
+        # A slow-response button belongs to the turn that created it. If the
+        # user sends a newer message without tapping that button, do not let
+        # the newer turn's answer disappear into the old request cache. Keep a
+        # READY result retrievable from its existing button, but detach the
+        # chat-level routing slot; resolve a still-PENDING old turn as
+        # superseded so tapping it gives a deterministic explanation.
+        previous_rid = self._pending_buttons.pop(chat_id, None)
+        if previous_rid:
+            previous_entry = self._cache.get(previous_rid)
+            if previous_entry and previous_entry.state is State.PENDING:
+                self._cache.set_error(
+                    previous_rid,
+                    "A newer message replaced this pending request.",
+                )
+            logger.info(
+                "LINE: detached stale slow-response button for new inbound "
+                "message chat=%s rid=%s state=%s",
+                chat_id,
+                previous_rid,
+                previous_entry.state.value if previous_entry else "missing",
+            )
+
         # Stash the reply token for outbound use.
         if chat_id and reply_token:
             self._reply_tokens[chat_id] = (
@@ -1580,6 +1602,11 @@ class LineAdapter(BasePlatformAdapter):
         pending_rid = self._pending_buttons.get(chat_id)
         if pending_rid:
             self._cache.set_ready(pending_rid, content)
+            logger.info(
+                "LINE: cached response behind slow-response button chat=%s rid=%s",
+                chat_id,
+                pending_rid,
+            )
             return SendResult(success=True, message_id=pending_rid)
 
         return await self._send_text_chunks(chat_id, content, force_push=False)
@@ -1603,6 +1630,11 @@ class LineAdapter(BasePlatformAdapter):
         if used_reply and not force_push:
             try:
                 await self._client.reply(token, messages)
+                logger.info(
+                    "LINE: delivered response via Reply API chat=%s messages=%d",
+                    chat_id,
+                    len(messages),
+                )
                 return SendResult(success=True, message_id=token)
             except Exception as exc:
                 logger.info("LINE: reply token rejected (%s); falling back to push", exc)
@@ -1610,6 +1642,11 @@ class LineAdapter(BasePlatformAdapter):
 
         try:
             await self._client.push(chat_id, messages)
+            logger.warning(
+                "LINE: delivered response via metered Push API chat=%s messages=%d",
+                chat_id,
+                len(messages),
+            )
             return SendResult(success=True, message_id=None)
         except Exception as exc:
             logger.error("LINE: push send failed: %s", exc)
