@@ -183,6 +183,9 @@ DEFAULT_OBSERVED_HISTORY_LIMIT = 50
 LINE_GROUP_REPLY_MEDIA_TYPES = frozenset(
     {"image", "video", "audio", "file", "sticker", "location"}
 )
+LINE_GROUP_IGNORABLE_MESSAGE_TYPES = frozenset(
+    {*LINE_GROUP_REPLY_MEDIA_TYPES, "emoji"}
+)
 
 # Media defaults
 MEDIA_TOKEN_TTL_SECONDS = 1800  # 30 minutes; LINE caches the URL aggressively
@@ -793,6 +796,48 @@ def _normalize_line_media_types(value: Any) -> Set[str]:
     return normalized
 
 
+def _normalize_line_group_message_types(value: Any) -> Set[str]:
+    """Return LINE group message categories that may be ignored outright."""
+    normalized = set()
+    for item in _config_list(value):
+        lowered = item.lower()
+        aliases = {
+            "photo": "image",
+            "picture": "image",
+            "voice": "audio",
+            "document": "file",
+            "emojis": "emoji",
+        }
+        lowered = aliases.get(lowered, lowered)
+        if lowered in LINE_GROUP_IGNORABLE_MESSAGE_TYPES:
+            normalized.add(lowered)
+    return normalized
+
+
+def _line_group_message_type(message: Dict[str, Any]) -> str:
+    """Classify LINE's inline emoji-only text payload separately from text.
+
+    LINE sends an emoji-only message as ``type=text`` with a display fallback
+    such as ``(laugh)`` plus structured ``emojis`` metadata. Treating it as
+    ordinary text makes it impossible to configure independently of chat.
+    """
+    msg_type = str((message or {}).get("type") or "")
+    if msg_type == "text" and (message or {}).get("emojis"):
+        text = str((message or {}).get("text") or "")
+        uncovered = list(text)
+        for emoji in (message or {}).get("emojis") or []:
+            try:
+                start = int(emoji.get("index"))
+                length = int(emoji.get("length"))
+            except (AttributeError, TypeError, ValueError):
+                continue
+            for index in range(max(0, start), min(len(uncovered), start + length)):
+                uncovered[index] = " "
+        if not "".join(uncovered).strip():
+            return "emoji"
+    return msg_type
+
+
 def _message_mentions_bot(
     message: Dict[str, Any], bot_user_id: Optional[str] = None
 ) -> bool:
@@ -940,6 +985,9 @@ class LineAdapter(BasePlatformAdapter):
         self.require_mention_chats = set(_config_list(extra.get("require_mention_chats")))
         self.reply_without_mention_media_types = _normalize_line_media_types(
             extra.get("reply_without_mention_media_types")
+        )
+        self.ignore_group_message_types = _normalize_line_group_message_types(
+            extra.get("ignore_group_message_types", "sticker,emoji")
         )
         self.show_system_notices_in_groups = _config_bool(
             extra.get("show_system_notices_in_groups"), False
@@ -1196,6 +1244,22 @@ class LineAdapter(BasePlatformAdapter):
             room_ids=self.allowed_rooms,
         ):
             logger.info("LINE: rejecting unauthorized source %s", source)
+            return
+
+        # Deterministically drop noisy group media before mention handling or
+        # agent dispatch. In particular, LINE's inline emoji-only messages are
+        # text payloads with an ``emojis`` array and fallback text like
+        # ``(laugh)``; classify them as ``emoji`` rather than normal text.
+        group_message_type = _line_group_message_type(event.get("message") or {})
+        if (
+            event_type == "message"
+            and source.get("type") in {"group", "room"}
+            and group_message_type in self.ignore_group_message_types
+        ):
+            logger.debug(
+                "LINE: ignoring configured group/room message type %s",
+                group_message_type,
+            )
             return
 
         # LINE includes authoritative mention metadata in text-message
@@ -1499,6 +1563,7 @@ class LineAdapter(BasePlatformAdapter):
                 "◐ Session automatically reset",
                 "🔄 Session auto-reset",
                 "📬 No home channel is set",
+                "💾 Self-improvement review:",
             ))
         ):
             logger.info("LINE: suppressed group system notice for chat %s", chat_id)
@@ -2057,6 +2122,7 @@ def _apply_yaml_config(_yaml_cfg: dict, platform_cfg: dict) -> dict:
         "free_response_chats",
         "require_mention_chats",
         "reply_without_mention_media_types",
+        "ignore_group_message_types",
         "show_system_notices_in_groups",
         "allowed_users",
         "allowed_groups",
@@ -2133,6 +2199,16 @@ def register(ctx) -> None:
                     "mention-only groups, e.g. image,video."
                 ),
                 "default": "",
+            },
+            {
+                "key": "ignore_group_message_types",
+                "type": "string",
+                "label": "Group message types to ignore",
+                "description": (
+                    "Comma-separated LINE types never sent to the agent in "
+                    "groups/rooms. Defaults to sticker,emoji."
+                ),
+                "default": "sticker,emoji",
             },
             {
                 "key": "allowed_groups",

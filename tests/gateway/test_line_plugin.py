@@ -162,6 +162,48 @@ class TestRequireMention:
         asyncio.run(adapter._dispatch_event(self._event()))
         adapter._handle_message_event.assert_not_awaited()
 
+    @pytest.mark.parametrize("message", [
+        {"id": "s1", "type": "sticker", "keywords": ["lol"]},
+        {
+            "id": "e1",
+            "type": "text",
+            "text": "(laugh)",
+            "emojis": [{"index": 0, "length": 7, "productId": "p", "emojiId": "1"}],
+        },
+    ])
+    def test_default_noisy_group_types_are_ignored_even_without_mention_gate(
+        self, monkeypatch, message
+    ):
+        adapter = self._adapter(monkeypatch, require_mention=False)
+
+        asyncio.run(adapter._dispatch_event(self._event(message=message)))
+
+        adapter._handle_message_event.assert_not_awaited()
+
+    def test_group_type_ignore_list_can_be_cleared(self, monkeypatch):
+        adapter = self._adapter(monkeypatch, require_mention=False)
+        adapter.ignore_group_message_types.clear()
+        event = self._event(message={"id": "s1", "type": "sticker"})
+
+        asyncio.run(adapter._dispatch_event(event))
+
+        adapter._handle_message_event.assert_awaited_once_with(event)
+
+    def test_text_with_inline_emoji_and_words_is_not_treated_as_emoji_only(
+        self, monkeypatch
+    ):
+        adapter = self._adapter(monkeypatch, require_mention=False)
+        event = self._event(message={
+            "id": "e2",
+            "type": "text",
+            "text": "hello (laugh)",
+            "emojis": [{"index": 6, "length": 7, "productId": "p", "emojiId": "1"}],
+        })
+
+        asyncio.run(adapter._dispatch_event(event))
+
+        adapter._handle_message_event.assert_awaited_once_with(event)
+
     def test_mentioned_group_message_is_admitted(self, monkeypatch):
         adapter = self._adapter(monkeypatch)
         event = self._event(message={
@@ -313,12 +355,14 @@ class TestRequireMention:
             "free_response_chats": ["C-open"],
             "require_mention_chats": ["C-quiet"],
             "reply_without_mention_media_types": ["image", "video"],
+            "ignore_group_message_types": ["sticker", "emoji"],
         }) == {
             "observe_unmentioned_group_messages": True,
             "observed_history_limit": 25,
             "free_response_chats": ["C-open"],
             "require_mention_chats": ["C-quiet"],
             "reply_without_mention_media_types": ["image", "video"],
+            "ignore_group_message_types": ["sticker", "emoji"],
         }
 
 
@@ -485,6 +529,7 @@ class TestSendRouting:
         "◐ Session automatically reset",
         "🔄 Session auto-reset",
         "📬 No home channel is set",
+        "💾 Self-improvement review:",
     ])
     def test_group_system_notice_is_suppressed_without_using_reply_or_push(
         self, adapter, prefix
