@@ -9447,6 +9447,12 @@ async def update_messaging_platform(
                                 status_code=400,
                                 detail=f"{key} must be at most {maximum}",
                             )
+                    elif field_type == "string":
+                        if not isinstance(value, str):
+                            raise HTTPException(
+                                status_code=400,
+                                detail=f"{key} must be a string",
+                            )
                     platform_section[key] = value
                 save_config(config)
 

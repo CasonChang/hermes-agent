@@ -1557,11 +1557,11 @@ export interface MessagingPlatformEnvVar {
 
 export interface MessagingPlatformConfigField {
   key: string;
-  type: "boolean" | "integer";
+  type: "boolean" | "integer" | "string";
   label: string;
   description: string;
-  value: boolean | number;
-  default: boolean | number;
+  value: boolean | number | string;
+  default: boolean | number | string;
   min?: number;
   max?: number;
 }
@@ -1602,7 +1602,7 @@ export interface MessagingPlatformUpdate {
   enabled?: boolean;
   env?: Record<string, string>;
   clear_env?: string[];
-  config?: Record<string, boolean | number>;
+  config?: Record<string, boolean | number | string>;
 }
 
 export interface MessagingPlatformTestResult {

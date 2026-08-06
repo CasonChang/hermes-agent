@@ -180,6 +180,9 @@ DEFAULT_BUTTON_LABEL = "Get answer"
 DEFAULT_DELIVERED_TEXT = "Already replied ✅"
 DEFAULT_INTERRUPTED_TEXT = "Run was interrupted before completion."
 DEFAULT_OBSERVED_HISTORY_LIMIT = 50
+LINE_GROUP_REPLY_MEDIA_TYPES = frozenset(
+    {"image", "video", "audio", "file", "sticker", "location"}
+)
 
 # Media defaults
 MEDIA_TOKEN_TTL_SECONDS = 1800  # 30 minutes; LINE caches the URL aggressively
@@ -761,6 +764,35 @@ def _config_bool(value: Any, default: bool = False) -> bool:
     return bool(value)
 
 
+def _config_list(value: Any) -> List[str]:
+    """Parse config.yaml list-or-CSV settings into trimmed strings."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        parts = value.split(",")
+    elif isinstance(value, (list, tuple, set)):
+        parts = value
+    else:
+        parts = [value]
+    return [str(part).strip() for part in parts if str(part).strip()]
+
+
+def _normalize_line_media_types(value: Any) -> Set[str]:
+    """Return supported LINE message types that may bypass mention gating."""
+    normalized = set()
+    for item in _config_list(value):
+        lowered = item.lower()
+        if lowered in {"photo", "picture"}:
+            lowered = "image"
+        elif lowered in {"voice"}:
+            lowered = "audio"
+        elif lowered in {"document"}:
+            lowered = "file"
+        if lowered in LINE_GROUP_REPLY_MEDIA_TYPES:
+            normalized.add(lowered)
+    return normalized
+
+
 def _message_mentions_bot(
     message: Dict[str, Any], bot_user_id: Optional[str] = None
 ) -> bool:
@@ -779,6 +811,62 @@ def _message_mentions_bot(
         if bot_user_id and mentionee.get("userId") == bot_user_id:
             return True
     return False
+
+
+def _message_text_without_bot_mentions(
+    message: Dict[str, Any], bot_user_id: Optional[str] = None
+) -> str:
+    """Remove LINE mention spans for this bot from message text.
+
+    This lets ``@Hermes /model`` reach the generic gateway slash-command
+    parser as ``/model`` instead of plain chat text. LINE's offsets are in
+    Unicode code points for Messaging API text payloads, which matches Python
+    string indexing for the practical cases this adapter receives.
+    """
+    text = (message or {}).get("text", "") or ""
+    mention = (message or {}).get("mention") or {}
+    spans: List[Tuple[int, int]] = []
+    for mentionee in mention.get("mentionees") or []:
+        if not isinstance(mentionee, dict) or mentionee.get("type") != "user":
+            continue
+        if mentionee.get("isSelf") is not True and (
+            not bot_user_id or mentionee.get("userId") != bot_user_id
+        ):
+            continue
+        try:
+            index = int(mentionee.get("index"))
+            length = int(mentionee.get("length"))
+        except (TypeError, ValueError):
+            continue
+        if index < 0 or length <= 0:
+            continue
+        spans.append((index, index + length))
+    if not spans:
+        return text
+    parts: List[str] = []
+    cursor = 0
+    for start, end in sorted(spans):
+        start = max(0, min(len(text), start))
+        end = max(start, min(len(text), end))
+        parts.append(text[cursor:start])
+        cursor = end
+    parts.append(text[cursor:])
+    return re.sub(r"[ \t]{2,}", " ", "".join(parts)).strip()
+
+
+def _is_gateway_slash_command_text(text: str) -> bool:
+    """Return True when text starts with a gateway-recognized slash command."""
+    stripped = (text or "").lstrip()
+    if not stripped.startswith("/"):
+        return False
+    command = stripped[1:].split(None, 1)[0].split("@", 1)[0]
+    if not command:
+        return False
+    try:
+        from hermes_cli.commands import is_gateway_known_command
+        return is_gateway_known_command(command.lower())
+    except Exception:
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -835,18 +923,26 @@ class LineAdapter(BasePlatformAdapter):
         )
         self.allowed_users = _csv_set(
             os.getenv("LINE_ALLOWED_USERS", "")
-        ) | set(extra.get("allowed_users", []))
+        ) | set(_config_list(extra.get("allowed_users")))
         self.allowed_groups = _csv_set(
             os.getenv("LINE_ALLOWED_GROUPS", "")
-        ) | set(extra.get("allowed_groups", []))
+        ) | set(_config_list(extra.get("allowed_groups")))
         self.allowed_rooms = _csv_set(
             os.getenv("LINE_ALLOWED_ROOMS", "")
-        ) | set(extra.get("allowed_rooms", []))
+        ) | set(_config_list(extra.get("allowed_rooms")))
         # In groups/rooms, optionally admit only messages that structurally
         # mention this LINE bot. DMs are always unaffected.
         self.require_mention = _config_bool(extra.get("require_mention"), False)
         self.observe_unmentioned_group_messages = _config_bool(
             extra.get("observe_unmentioned_group_messages"), False
+        )
+        self.free_response_chats = set(_config_list(extra.get("free_response_chats")))
+        self.require_mention_chats = set(_config_list(extra.get("require_mention_chats")))
+        self.reply_without_mention_media_types = _normalize_line_media_types(
+            extra.get("reply_without_mention_media_types")
+        )
+        self.show_system_notices_in_groups = _config_bool(
+            extra.get("show_system_notices_in_groups"), False
         )
         try:
             observed_history_limit = int(
@@ -1108,8 +1204,8 @@ class LineAdapter(BasePlatformAdapter):
         if (
             event_type == "message"
             and source.get("type") in {"group", "room"}
-            and self.require_mention
-            and not _message_mentions_bot(event.get("message") or {}, self._bot_user_id)
+            and self._requires_mention_for_source(source)
+            and not self._message_bypasses_group_mention_gate(event.get("message") or {})
         ):
             if self.observe_unmentioned_group_messages:
                 await self._observe_unmentioned_group_message(event)
@@ -1151,7 +1247,7 @@ class LineAdapter(BasePlatformAdapter):
         text = ""
 
         if msg_type == "text":
-            text = msg.get("text", "") or ""
+            text = _message_text_without_bot_mentions(msg, self._bot_user_id)
         elif msg_type in ("image", "audio", "video", "file"):
             local_path, media_type = await self._download_media(
                 message_id,
@@ -1211,6 +1307,28 @@ class LineAdapter(BasePlatformAdapter):
             self._observed_group_history.settle(
                 chat_id, observed_entries, commit=True
             )
+
+    def _requires_mention_for_source(self, source: Dict[str, Any]) -> bool:
+        """Return per-chat mention policy for a LINE group/room source."""
+        chat_id, chat_type = _resolve_chat(source)
+        if chat_type not in {"group", "room"}:
+            return False
+        if chat_id in self.require_mention_chats:
+            return True
+        if chat_id in self.free_response_chats:
+            return False
+        return self.require_mention
+
+    def _message_bypasses_group_mention_gate(self, message: Dict[str, Any]) -> bool:
+        """Return True when an unmentioned group message may still dispatch."""
+        if _message_mentions_bot(message, self._bot_user_id):
+            return True
+        msg_type = (message or {}).get("type", "")
+        if msg_type == "text":
+            return _is_gateway_slash_command_text(
+                _message_text_without_bot_mentions(message, self._bot_user_id)
+            )
+        return msg_type in self.reply_without_mention_media_types
 
     async def _observe_unmentioned_group_message(
         self, event: Dict[str, Any]
@@ -1370,6 +1488,21 @@ class LineAdapter(BasePlatformAdapter):
     ) -> SendResult:
         if not self._client:
             return SendResult(success=False, error="LINE adapter not connected")
+
+        # Gateway lifecycle/setup notices are useful in DMs but noisy in a
+        # shared LINE group.  Suppress them before consuming the inbound reply
+        # token so the actual agent answer can still use the free Reply API.
+        if (
+            chat_id[:1] in {"C", "R"}
+            and not self.show_system_notices_in_groups
+            and content.startswith((
+                "◐ Session automatically reset",
+                "🔄 Session auto-reset",
+                "📬 No home channel is set",
+            ))
+        ):
+            logger.info("LINE: suppressed group system notice for chat %s", chat_id)
+            return SendResult(success=True, message_id=None)
 
         # System busy-acks (interrupting / queued / steered) bypass the
         # postback cache and route directly to LINE so they reach the user
@@ -1918,8 +2051,13 @@ def interactive_setup() -> None:
 def _apply_yaml_config(_yaml_cfg: dict, platform_cfg: dict) -> dict:
     """Bridge LINE-owned behavioral YAML keys into ``PlatformConfig.extra``."""
     keys = (
+        "require_mention",
         "observe_unmentioned_group_messages",
         "observed_history_limit",
+        "free_response_chats",
+        "require_mention_chats",
+        "reply_without_mention_media_types",
+        "show_system_notices_in_groups",
         "allowed_users",
         "allowed_groups",
         "allowed_rooms",
@@ -1965,6 +2103,66 @@ def register(ctx) -> None:
                 "default": DEFAULT_OBSERVED_HISTORY_LIMIT,
                 "min": 1,
                 "max": 200,
+            },
+            {
+                "key": "free_response_chats",
+                "type": "string",
+                "label": "Groups/rooms that do not require @mention",
+                "description": (
+                    "Comma-separated LINE group/room IDs (C.../R...) that "
+                    "can chat without tagging the bot."
+                ),
+                "default": "",
+            },
+            {
+                "key": "require_mention_chats",
+                "type": "string",
+                "label": "Groups/rooms that require @mention",
+                "description": (
+                    "Comma-separated LINE group/room IDs (C.../R...) that "
+                    "require tagging even when the global toggle is off."
+                ),
+                "default": "",
+            },
+            {
+                "key": "reply_without_mention_media_types",
+                "type": "string",
+                "label": "Media that can reply without @mention",
+                "description": (
+                    "Comma-separated LINE message types allowed through in "
+                    "mention-only groups, e.g. image,video."
+                ),
+                "default": "",
+            },
+            {
+                "key": "allowed_groups",
+                "type": "string",
+                "label": "Groups where every member may talk",
+                "description": (
+                    "Comma-separated LINE group IDs (C...). Everyone in these "
+                    "groups is authorized; individual user IDs are not required."
+                ),
+                "default": "",
+            },
+            {
+                "key": "allowed_rooms",
+                "type": "string",
+                "label": "Rooms where every member may talk",
+                "description": (
+                    "Comma-separated LINE room IDs (R...). Everyone in these "
+                    "rooms is authorized; individual user IDs are not required."
+                ),
+                "default": "",
+            },
+            {
+                "key": "show_system_notices_in_groups",
+                "type": "boolean",
+                "label": "Show system notices in groups",
+                "description": (
+                    "Show session-reset and missing-home-channel notices in "
+                    "LINE groups/rooms. Disabled by default to reduce noise."
+                ),
+                "default": False,
             },
         ),
         cron_deliver_env_var="LINE_HOME_CHANNEL",
