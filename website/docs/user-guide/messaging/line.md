@@ -104,8 +104,14 @@ line:
   reply_without_mention_media_types:
     - image
     - video
+  # Never dispatch these group/room message categories to the agent. LINE
+  # inline emoji-only messages arrive as text plus structured emoji metadata.
+  ignore_group_message_types:
+    - sticker
+    - emoji
   # Keep shared chats clean. Set true only if the group should see lifecycle
-  # notices such as session resets and the missing-home-channel reminder.
+  # notices such as session resets, missing-home reminders, and delayed
+  # self-improvement review summaries.
   show_system_notices_in_groups: false
 ```
 
@@ -209,11 +215,27 @@ when more than five LINE message objects must be sent and the follow-up batch
 has no reply token.
 
 By default, LINE groups/rooms suppress the gateway's session-reset and
-missing-home-channel setup notices. Suppression happens before the reply token
+missing-home-channel setup notices as well as delayed self-improvement review
+summaries. Suppression happens before the reply token
 is consumed, so these hidden notices use neither Reply nor Push quota and the
 real agent answer can still use the inbound free reply token. Direct messages
 continue to show these notices. Enable `line.show_system_notices_in_groups` if
 you prefer the operational messages to appear in shared chats.
+
+The self-improvement review runs asynchronously after the main answer. Without
+this LINE group suppression, its later notification has no inbound reply token
+left and therefore normally uses Push. To hide the review notification on all
+platforms (including DMs), set `display.memory_notifications: off`; the review
+and any approved memory/skill writes still run.
+
+LINE stickers have a real webhook type of `sticker`. LINE's small inline emoji
+messages are different: the webhook type is `text`, the visible fallback may be
+`(laugh)`, and an `emojis` metadata array identifies it. The adapter classifies
+that structured form as `emoji`, so the default
+`line.ignore_group_message_types: sticker,emoji` drops both deterministically
+before an agent/model call. This is code/config behavior; asking the agent not
+to answer only teaches a preference and may make the model choose an empty or
+quiet response, but the message still consumed an agent turn before this gate.
 
 ---
 
