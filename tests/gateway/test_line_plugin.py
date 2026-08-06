@@ -210,7 +210,9 @@ class TestRequireMention:
             "id": "m1",
             "type": "text",
             "text": "@Hermes hello",
-            "mention": {"mentionees": [{"type": "user", "isSelf": True}]},
+            "mention": {"mentionees": [{
+                "type": "user", "isSelf": True, "index": 0, "length": 7,
+            }]},
         })
         asyncio.run(adapter._dispatch_event(event))
         adapter._handle_message_event.assert_awaited_once_with(event)
@@ -313,7 +315,33 @@ class TestRequireMention:
         delivered = adapter.handle_message.await_args.args[0]
         assert "we prefer option B" in delivered.channel_context
         assert "not requests" in delivered.channel_context
+        assert "explicitly @mentioned this bot" in delivered.channel_context
+        assert "respond normally" in delivered.channel_context
         assert adapter._observed_group_history.reserve("C-chat") == []
+
+    def test_mention_without_observed_history_still_carries_addressing_metadata(
+        self, monkeypatch
+    ):
+        adapter = self._adapter(monkeypatch)
+        adapter.handle_message = AsyncMock()
+        del adapter._handle_message_event
+        trigger = self._event(message={
+            "id": "trigger",
+            "type": "text",
+            "text": "@Hermes hello",
+            "mention": {"mentionees": [{
+                "type": "user",
+                "isSelf": True,
+                "index": 0,
+                "length": 7,
+            }]},
+        })
+
+        asyncio.run(adapter._dispatch_event(trigger))
+
+        delivered = adapter.handle_message.await_args.args[0]
+        assert delivered.text == "hello"
+        assert "explicitly @mentioned this bot" in delivered.channel_context
 
     def test_unmentioned_group_image_is_cached_not_dispatched(self, monkeypatch):
         adapter = self._adapter(monkeypatch)

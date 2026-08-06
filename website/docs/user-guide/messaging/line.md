@@ -127,6 +127,11 @@ Slash commands such as `/model`, `/new`, and `/help` bypass the mention gate
 in authorized LINE groups/rooms so you can operate the bot without tagging it
 first. If you do tag the bot before a command (for example `@Hermes /model`),
 Hermes strips the bot mention before handing the command to the gateway parser.
+For ordinary tagged messages it also adds authoritative LINE delivery metadata
+to the current user turn stating that the new message explicitly mentioned the
+bot. This keeps the observed-history warning ("not addressed to you") from
+being misapplied to the new tagged message after the visible mention span is
+removed.
 
 These behavioral settings are also available under **Dashboard → Channels →
 LINE → Configure**. Saving them updates the top-level `line:` block and takes

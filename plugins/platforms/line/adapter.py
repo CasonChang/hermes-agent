@@ -517,6 +517,30 @@ def _render_observed_group_context(entries: List[_ObservedGroupMessage]) -> str:
     return "\n".join(lines)
 
 
+def _render_line_channel_context(
+    entries: List[_ObservedGroupMessage], *, explicitly_mentioned: bool
+) -> Optional[str]:
+    """Render ambient history plus authoritative addressing metadata.
+
+    The adapter removes the bot's mention span from text so tagged slash
+    commands remain parseable. Without a separate marker, the model sees only
+    the cleaned text after a prominent "not addressed to you" ambient-history
+    warning and may incorrectly choose intentional silence. Keep the two facts
+    explicit and adjacent to the current user turn.
+    """
+    parts = []
+    observed = _render_observed_group_context(entries)
+    if observed:
+        parts.append(observed)
+    if explicitly_mentioned:
+        parts.append(
+            "[LINE delivery metadata — the new message explicitly @mentioned "
+            "this bot. It is addressed to you; respond normally. The observed "
+            "messages above remain context only.]"
+        )
+    return "\n\n".join(parts) or None
+
+
 # ---------------------------------------------------------------------------
 # Source / chat-id resolution
 # ---------------------------------------------------------------------------
@@ -1371,6 +1395,10 @@ class LineAdapter(BasePlatformAdapter):
             if chat_type in {"group", "room"}
             else []
         )
+        explicitly_mentioned = (
+            chat_type in {"group", "room"}
+            and _message_mentions_bot(msg, self._bot_user_id)
+        )
         event_obj = MessageEvent(
             text=text,
             message_type=_LINE_MESSAGE_TYPES.get(msg_type, MessageType.TEXT),
@@ -1379,7 +1407,10 @@ class LineAdapter(BasePlatformAdapter):
             message_id=message_id,
             media_urls=media_urls,
             media_types=media_types,
-            channel_context=_render_observed_group_context(observed_entries) or None,
+            channel_context=_render_line_channel_context(
+                observed_entries,
+                explicitly_mentioned=explicitly_mentioned,
+            ),
         )
 
         try:
