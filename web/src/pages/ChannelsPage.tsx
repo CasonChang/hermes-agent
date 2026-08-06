@@ -143,7 +143,7 @@ export default function ChannelsPage() {
   // Config modal state
   const [editing, setEditing] = useState<MessagingPlatform | null>(null);
   const [draftEnv, setDraftEnv] = useState<Record<string, string>>({});
-  const [draftConfig, setDraftConfig] = useState<Record<string, boolean | number>>({});
+  const [draftConfig, setDraftConfig] = useState<Record<string, boolean | number | string>>({});
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
   const [saving, setSaving] = useState(false);
   const closeEdit = useCallback(() => {
@@ -536,7 +536,7 @@ export default function ChannelsPage() {
                             }
                           />
                         </div>
-                      ) : (
+                      ) : field.type === "integer" ? (
                         <>
                           <Label htmlFor={`config-${field.key}`}>{field.label}</Label>
                           <span className="text-xs text-muted-foreground">
@@ -552,6 +552,24 @@ export default function ChannelsPage() {
                               setDraftConfig((previous) => ({
                                 ...previous,
                                 [field.key]: Number(event.target.value),
+                              }))
+                            }
+                          />
+                        </>
+                      ) : (
+                        <>
+                          <Label htmlFor={`config-${field.key}`}>{field.label}</Label>
+                          <span className="text-xs text-muted-foreground">
+                            {field.description}
+                          </span>
+                          <Input
+                            id={`config-${field.key}`}
+                            type="text"
+                            value={String(draftConfig[field.key] ?? field.default)}
+                            onChange={(event) =>
+                              setDraftConfig((previous) => ({
+                                ...previous,
+                                [field.key]: event.target.value,
                               }))
                             }
                           />

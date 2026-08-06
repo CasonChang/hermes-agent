@@ -102,6 +102,12 @@ class TestProfileScopedMessagingReads:
                     "require_mention": True,
                     "observe_unmentioned_group_messages": True,
                     "observed_history_limit": 25,
+                    "free_response_chats": "C-open",
+                    "require_mention_chats": "C-quiet",
+                    "reply_without_mention_media_types": "image,video",
+                    "allowed_groups": "C-friends",
+                    "allowed_rooms": "R-friends",
+                    "show_system_notices_in_groups": False,
                 },
             },
         )
@@ -116,6 +122,12 @@ class TestProfileScopedMessagingReads:
             "require_mention": True,
             "observe_unmentioned_group_messages": True,
             "observed_history_limit": 25,
+            "free_response_chats": "C-open",
+            "require_mention_chats": "C-quiet",
+            "reply_without_mention_media_types": "image,video",
+            "allowed_groups": "C-friends",
+            "allowed_rooms": "R-friends",
+            "show_system_notices_in_groups": False,
         }
         assert "line" not in (saved.get("platforms") or {})
 
@@ -128,6 +140,12 @@ class TestProfileScopedMessagingReads:
             "require_mention": True,
             "observe_unmentioned_group_messages": True,
             "observed_history_limit": 25,
+            "free_response_chats": "C-open",
+            "require_mention_chats": "C-quiet",
+            "reply_without_mention_media_types": "image,video",
+            "allowed_groups": "C-friends",
+            "allowed_rooms": "R-friends",
+            "show_system_notices_in_groups": False,
         }
 
     def test_scoped_read_returns_profile_path_command_and_startup_failure(

@@ -47,6 +47,7 @@ _standalone_send = _line._standalone_send
 _env_enablement = _line._env_enablement
 _MessageDeduplicator = _line._MessageDeduplicator
 _message_mentions_bot = _line._message_mentions_bot
+_message_text_without_bot_mentions = _line._message_text_without_bot_mentions
 _apply_yaml_config = _line._apply_yaml_config
 
 
@@ -106,6 +107,16 @@ class TestAllowlist:
         src = {"type": "user", "userId": "Uok"}
         assert _allowed_for_source(src, allow_all=False, user_ids={"Uok"}, group_ids=set(), room_ids=set())
 
+    def test_allowed_group_authorizes_every_member(self):
+        src = {"type": "group", "groupId": "Cfriends", "userId": "Ufriend"}
+        assert _allowed_for_source(
+            src,
+            allow_all=False,
+            user_ids=set(),
+            group_ids={"Cfriends"},
+            room_ids=set(),
+        )
+
 
 class TestRequireMention:
 
@@ -160,6 +171,56 @@ class TestRequireMention:
             "mention": {"mentionees": [{"type": "user", "isSelf": True}]},
         })
         asyncio.run(adapter._dispatch_event(event))
+        adapter._handle_message_event.assert_awaited_once_with(event)
+
+    def test_group_slash_command_bypasses_mention_gate(self, monkeypatch):
+        adapter = self._adapter(monkeypatch)
+        event = self._event(message={
+            "id": "m1",
+            "type": "text",
+            "text": "/model",
+        })
+
+        asyncio.run(adapter._dispatch_event(event))
+
+        adapter._handle_message_event.assert_awaited_once_with(event)
+
+    def test_mentioned_slash_command_strips_bot_mention(self):
+        message = {
+            "type": "text",
+            "text": "@Hermes /model",
+            "mention": {
+                "mentionees": [
+                    {"type": "user", "isSelf": True, "index": 0, "length": 7}
+                ]
+            },
+        }
+
+        assert _message_text_without_bot_mentions(message) == "/model"
+
+    def test_free_response_chat_overrides_global_require_mention(self, monkeypatch):
+        adapter = self._adapter(monkeypatch)
+        adapter.free_response_chats = {"C-chat"}
+
+        asyncio.run(adapter._dispatch_event(self._event()))
+
+        adapter._handle_message_event.assert_awaited_once()
+
+    def test_require_mention_chat_overrides_global_free_response(self, monkeypatch):
+        adapter = self._adapter(monkeypatch, require_mention=False)
+        adapter.require_mention_chats = {"C-chat"}
+
+        asyncio.run(adapter._dispatch_event(self._event()))
+
+        adapter._handle_message_event.assert_not_awaited()
+
+    def test_unmentioned_configured_media_type_is_admitted(self, monkeypatch):
+        adapter = self._adapter(monkeypatch)
+        adapter.reply_without_mention_media_types = {"image", "video"}
+        event = self._event(message={"id": "image-1", "type": "image"})
+
+        asyncio.run(adapter._dispatch_event(event))
+
         adapter._handle_message_event.assert_awaited_once_with(event)
 
     def test_dm_is_not_gated(self, monkeypatch):
@@ -249,9 +310,15 @@ class TestRequireMention:
         assert _apply_yaml_config({}, {
             "observe_unmentioned_group_messages": True,
             "observed_history_limit": 25,
+            "free_response_chats": ["C-open"],
+            "require_mention_chats": ["C-quiet"],
+            "reply_without_mention_media_types": ["image", "video"],
         }) == {
             "observe_unmentioned_group_messages": True,
             "observed_history_limit": 25,
+            "free_response_chats": ["C-open"],
+            "require_mention_chats": ["C-quiet"],
+            "reply_without_mention_media_types": ["image", "video"],
         }
 
 
@@ -414,6 +481,34 @@ class TestSendRouting:
         assert "**" not in out
         assert "https://x.com" in out
 
+    @pytest.mark.parametrize("prefix", [
+        "◐ Session automatically reset",
+        "🔄 Session auto-reset",
+        "📬 No home channel is set",
+    ])
+    def test_group_system_notice_is_suppressed_without_using_reply_or_push(
+        self, adapter, prefix
+    ):
+        adapter._reply_tokens["Cfriends"] = ("reply-token", 10**12)
+
+        result = asyncio.run(adapter.send("Cfriends", f"{prefix}: details"))
+
+        assert result.success
+        adapter._client.reply.assert_not_awaited()
+        adapter._client.push.assert_not_awaited()
+        assert "Cfriends" in adapter._reply_tokens
+
+    def test_group_system_notice_can_be_enabled(self, adapter):
+        adapter.show_system_notices_in_groups = True
+        adapter._reply_tokens["Cfriends"] = ("reply-token", 10**12)
+
+        result = asyncio.run(adapter.send(
+            "Cfriends", "📬 No home channel is set for Line."
+        ))
+
+        assert result.success
+        adapter._client.reply.assert_awaited_once()
+
 
 # ---------------------------------------------------------------------------
 # 9. Register() metadata + plugin entry points
@@ -522,6 +617,7 @@ class TestAdapterInit:
                 "port": 7777,
                 "public_url": "https://x.example.com",
                 "allowed_users": ["U1", "U2"],
+                "allowed_groups": "C1,C2",
             },
         )
         ad = LineAdapter(cfg)
@@ -530,6 +626,7 @@ class TestAdapterInit:
         assert ad.webhook_port == 7777
         assert ad.public_base_url == "https://x.example.com"
         assert ad.allowed_users == {"U1", "U2"}
+        assert ad.allowed_groups == {"C1", "C2"}
 
 
 # ---------------------------------------------------------------------------
