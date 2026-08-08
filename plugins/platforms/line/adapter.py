@@ -191,6 +191,8 @@ LINE_GROUP_IGNORABLE_MESSAGE_TYPES = frozenset(
 MEDIA_TOKEN_TTL_SECONDS = 1800  # 30 minutes; LINE caches the URL aggressively
 LINE_IMAGE_MAX_BYTES = 10 * 1024 * 1024  # 10 MB per LINE docs
 LINE_AV_MAX_BYTES = 200 * 1024 * 1024  # 200 MB for voice/video
+LINE_CONTENT_FETCH_ATTEMPTS = 4
+LINE_CONTENT_RETRY_DELAYS = (0.5, 1.0, 2.0)
 
 # Map LINE webhook message types to the normalized MessageType the gateway
 # routes on. LINE has no separate "voice" type — audio messages are recorded
@@ -653,16 +655,92 @@ class _LineClient:
         except Exception as exc:  # best-effort; never raise
             logger.debug("LINE loading indicator failed: %s", exc)
 
-    async def fetch_content(self, message_id: str) -> bytes:
-        """Download an inbound media message's binary content."""
+    async def fetch_content(self, message_id: str, *, media_type: str = "unknown") -> bytes:
+        """Download non-empty inbound media content with bounded retries.
+
+        LINE can return HTTP 202 while large audio/video content is still
+        being prepared.  A 200 response with an empty body is also treated as
+        transient because no supported inbound media can be represented by
+        zero bytes.  Definitive 4xx responses are never retried.
+        """
         import aiohttp
+
         url = LINE_CONTENT_URL_FMT.format(message_id=message_id)
         timeout = aiohttp.ClientTimeout(total=30.0)
+        message_ref = hashlib.sha256(message_id.encode("utf-8")).hexdigest()[:12]
+        last_error: Optional[Exception] = None
+
         async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
-            async with session.get(url, headers={"Authorization": f"Bearer {self._token}"}) as resp:
-                if resp.status >= 400:
-                    raise RuntimeError(f"LINE content {resp.status}")
-                return await resp.read()
+            for attempt in range(1, LINE_CONTENT_FETCH_ATTEMPTS + 1):
+                try:
+                    async with session.get(
+                        url,
+                        headers={"Authorization": f"Bearer {self._token}"},
+                    ) as resp:
+                        data = await resp.read()
+                        content_type = resp.headers.get("Content-Type", "")
+                        content_length = resp.headers.get("Content-Length", "")
+                        redirect_statuses = [item.status for item in resp.history]
+                        logger.info(
+                            "LINE content fetch media_type=%s message_ref=%s "
+                            "attempt=%d/%d status=%d content_type=%r "
+                            "content_length=%r bytes_read=%d redirects=%s",
+                            media_type,
+                            message_ref,
+                            attempt,
+                            LINE_CONTENT_FETCH_ATTEMPTS,
+                            resp.status,
+                            content_type,
+                            content_length,
+                            len(data),
+                            redirect_statuses,
+                        )
+
+                        if resp.status == 200 and data:
+                            return data
+
+                        if resp.status == 202:
+                            last_error = RuntimeError(
+                                "LINE content is still being prepared (HTTP 202)"
+                            )
+                        elif resp.status == 200:
+                            last_error = RuntimeError(
+                                "LINE content returned an empty HTTP 200 payload"
+                            )
+                        elif resp.status == 429 or resp.status >= 500:
+                            last_error = RuntimeError(
+                                f"LINE content returned transient HTTP {resp.status}"
+                            )
+                        else:
+                            raise RuntimeError(
+                                f"LINE content download failed with HTTP {resp.status}"
+                            )
+                except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                    safe_message = str(exc).replace(message_id, message_ref).replace(
+                        self._token, "<redacted>"
+                    )
+                    last_error = RuntimeError(
+                        f"{type(exc).__name__}: {safe_message}"
+                    )
+                    logger.warning(
+                        "LINE content fetch exception media_type=%s message_ref=%s "
+                        "attempt=%d/%d exception_type=%s exception=%s",
+                        media_type,
+                        message_ref,
+                        attempt,
+                        LINE_CONTENT_FETCH_ATTEMPTS,
+                        type(exc).__name__,
+                        safe_message,
+                    )
+
+                if attempt < LINE_CONTENT_FETCH_ATTEMPTS:
+                    await asyncio.sleep(LINE_CONTENT_RETRY_DELAYS[attempt - 1])
+
+        raise RuntimeError(
+            f"LINE {media_type} content download failed after "
+            f"{LINE_CONTENT_FETCH_ATTEMPTS} attempts for message_ref={message_ref}: "
+            f"{last_error}"
+        )
 
     async def get_bot_user_id(self) -> Optional[str]:
         """Fetch this channel's own userId so we can filter self-messages."""
@@ -1364,9 +1442,16 @@ class LineAdapter(BasePlatformAdapter):
                 msg_type,
                 filename=msg.get("fileName") or msg.get("file_name"),
             )
-            if local_path:
-                media_urls.append(local_path)
-                media_types.append(media_type)
+            if not local_path:
+                logger.warning(
+                    "LINE: dropping inbound media event after download failure "
+                    "media_type=%s message_ref=%s",
+                    msg_type,
+                    hashlib.sha256(message_id.encode("utf-8")).hexdigest()[:12],
+                )
+                return
+            media_urls.append(local_path)
+            media_types.append(media_type)
             text = f"[{msg_type}]"
         elif msg_type == "sticker":
             keywords = msg.get("keywords") or []
@@ -1564,9 +1649,28 @@ class LineAdapter(BasePlatformAdapter):
         if not self._client or not message_id:
             return None, ""
         try:
-            data = await self._client.fetch_content(message_id)
+            data = await self._client.fetch_content(message_id, media_type=msg_type)
         except Exception as exc:
-            logger.warning("LINE: failed to fetch %s content for %s: %s", msg_type, message_id, exc)
+            message_ref = hashlib.sha256(message_id.encode("utf-8")).hexdigest()[:12]
+            logger.warning(
+                "LINE: inbound media download failed media_type=%s "
+                "message_ref=%s exception_type=%s exception=%s",
+                msg_type,
+                message_ref,
+                type(exc).__name__,
+                exc,
+            )
+            return None, ""
+        if not data:
+            # Keep the cache boundary safe even for alternate/test clients
+            # that do not use _LineClient.fetch_content().
+            message_ref = hashlib.sha256(message_id.encode("utf-8")).hexdigest()[:12]
+            logger.warning(
+                "LINE: refusing empty inbound media payload media_type=%s "
+                "message_ref=%s",
+                msg_type,
+                message_ref,
+            )
             return None, ""
         ext = {
             "image": ".jpg",
