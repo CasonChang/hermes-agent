@@ -20,6 +20,8 @@ import hashlib
 import hmac
 import base64
 import json
+import sys
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -40,6 +42,7 @@ _is_system_bypass = _line._is_system_bypass
 RequestCache = _line.RequestCache
 State = _line.State
 LineAdapter = _line.LineAdapter
+_LineClient = _line._LineClient
 register = _line.register
 check_requirements = _line.check_requirements
 validate_config = _line.validate_config
@@ -503,6 +506,46 @@ class TestInboundMedia:
         assert event.media_urls == ["/cache/image.jpg"]
         assert event.media_types == ["image/jpeg"]
 
+    def test_audio_non_empty_payload_is_cached(self, adapter):
+        adapter._client.fetch_content = AsyncMock(return_value=b"audio-bytes")
+        with patch.object(
+            _line, "cache_audio_from_bytes", return_value="/cache/audio.m4a"
+        ) as cache:
+            asyncio.run(adapter._handle_message_event(self._event("audio")))
+
+        adapter._client.fetch_content.assert_awaited_once_with(
+            "audio-1", media_type="audio"
+        )
+        cache.assert_called_once_with(b"audio-bytes", ext=".m4a")
+        event = self._captured_event(adapter)
+        assert event.message_type is _line.MessageType.VOICE
+        assert event.media_urls == ["/cache/audio.m4a"]
+
+    def test_audio_empty_payload_is_rejected_before_cache(self, adapter):
+        adapter._client.fetch_content = AsyncMock(return_value=b"")
+        with patch.object(_line, "cache_audio_from_bytes") as cache:
+            asyncio.run(adapter._handle_message_event(self._event("audio")))
+
+        cache.assert_not_called()
+        adapter.handle_message.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        ("msg_type", "cache_name", "cache_path", "expected_type"),
+        [
+            ("image", "cache_image_from_bytes", "/cache/image.jpg", _line.MessageType.PHOTO),
+            ("video", "cache_video_from_bytes", "/cache/video.mp4", _line.MessageType.VIDEO),
+        ],
+    )
+    def test_non_audio_media_still_cache_and_dispatch(
+        self, adapter, msg_type, cache_name, cache_path, expected_type
+    ):
+        with patch.object(_line, cache_name, return_value=cache_path):
+            asyncio.run(adapter._handle_message_event(self._event(msg_type)))
+
+        event = self._captured_event(adapter)
+        assert event.message_type is expected_type
+        assert event.media_urls == [cache_path]
+
     def test_new_inbound_detaches_and_resolves_stale_pending_button(self, adapter):
         rid = adapter._cache.register_pending("Cline")
         adapter._pending_buttons["Cline"] = rid
@@ -536,6 +579,120 @@ class TestInboundMedia:
         entry = adapter._cache.get(rid)
         assert entry.state is State.READY
         assert entry.payload == "old answer"
+
+
+class _ContentResponse:
+    def __init__(self, status, body=b"", headers=None, history=()):
+        self.status = status
+        self._body = body
+        self.headers = headers or {}
+        self.history = [SimpleNamespace(status=item) for item in history]
+
+    async def read(self):
+        return self._body
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return False
+
+
+class _ContentSession:
+    def __init__(self, responses):
+        self.responses = iter(responses)
+        self.calls = 0
+
+    def get(self, *_args, **_kwargs):
+        self.calls += 1
+        item = next(self.responses)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return False
+
+
+class TestContentFetch:
+    @staticmethod
+    def _aiohttp(session):
+        class ClientError(Exception):
+            pass
+
+        return SimpleNamespace(
+            ClientError=ClientError,
+            ClientTimeout=lambda **kwargs: kwargs,
+            ClientSession=lambda **kwargs: session,
+        )
+
+    def test_http_200_non_empty_audio_succeeds(self, monkeypatch, caplog):
+        caplog.set_level("INFO", logger=_line.__name__)
+        session = _ContentSession([_ContentResponse(
+            200,
+            b"audio-data",
+            headers={"Content-Type": "audio/mp4", "Content-Length": "10"},
+            history=(307,),
+        )])
+        monkeypatch.setitem(sys.modules, "aiohttp", self._aiohttp(session))
+
+        result = asyncio.run(_LineClient("secret-token").fetch_content(
+            "private-message-id", media_type="audio"
+        ))
+
+        assert result == b"audio-data"
+        assert session.calls == 1
+        assert "media_type=audio" in caplog.text
+        assert "status=200" in caplog.text
+        assert "content_type='audio/mp4'" in caplog.text
+        assert "content_length='10'" in caplog.text
+        assert "bytes_read=10" in caplog.text
+        assert "redirects=[307]" in caplog.text
+        assert "private-message-id" not in caplog.text
+        assert "secret-token" not in caplog.text
+
+    def test_http_200_empty_audio_retries_then_fails(self, monkeypatch):
+        session = _ContentSession([_ContentResponse(200)] * 4)
+        monkeypatch.setitem(sys.modules, "aiohttp", self._aiohttp(session))
+        monkeypatch.setattr(_line.asyncio, "sleep", AsyncMock())
+
+        with pytest.raises(RuntimeError, match="empty HTTP 200 payload"):
+            asyncio.run(_LineClient("secret-token").fetch_content(
+                "safe-test-message", media_type="audio"
+            ))
+
+        assert session.calls == 4
+
+    def test_http_202_retries_then_succeeds(self, monkeypatch):
+        session = _ContentSession([
+            _ContentResponse(202, headers={"Content-Length": "0"}),
+            _ContentResponse(200, b"ready-audio"),
+        ])
+        monkeypatch.setitem(sys.modules, "aiohttp", self._aiohttp(session))
+        sleep = AsyncMock()
+        monkeypatch.setattr(_line.asyncio, "sleep", sleep)
+
+        result = asyncio.run(_LineClient("secret-token").fetch_content(
+            "safe-test-message", media_type="audio"
+        ))
+
+        assert result == b"ready-audio"
+        assert session.calls == 2
+        sleep.assert_awaited_once_with(0.5)
+
+    def test_definitive_http_error_is_not_retried(self, monkeypatch):
+        session = _ContentSession([_ContentResponse(404, b"not found")])
+        monkeypatch.setitem(sys.modules, "aiohttp", self._aiohttp(session))
+
+        with pytest.raises(RuntimeError, match="HTTP 404"):
+            asyncio.run(_LineClient("secret-token").fetch_content(
+                "safe-test-message", media_type="audio"
+            ))
+
+        assert session.calls == 1
 
 
 # ---------------------------------------------------------------------------
