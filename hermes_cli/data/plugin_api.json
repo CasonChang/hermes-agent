@@ -151,6 +151,10 @@
     {
       "source": "adding-platform-adapters.md § Public helpers for platform plugins",
       "entries": [
+        "gateway.rich_sent_store:record",
+        "gateway.rich_sent_store:lookup",
+        "gateway.rich_sent_store:record_marker",
+        "gateway.rich_sent_store:lookup_marker",
         "gateway.platforms.access_policy_mixin:OwnAccessPolicyMixin",
         "tools.approval:resolve_gateway_approval",
         "tools.approval:resolve_gateway_approval_card",
