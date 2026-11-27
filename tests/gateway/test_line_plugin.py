@@ -1055,6 +1055,26 @@ class TestLineGroupFilters(_LineGroupHarness):
         assert self._dispatch(adapter, source, _text("hello"), webhook) is None
         adapter._download_media.assert_not_awaited()
 
+    @pytest.mark.parametrize("observation_limit", ["0", "5"])
+    @pytest.mark.parametrize("original,expected_quote", [
+        (_text("Meet at the south entrance"), "Meet at the south entrance"),
+        ({"type": "image", "id": "photo"}, "[image]"),
+    ], ids=["unmentioned-text", "ignored-image"])
+    def test_mentioned_reply_resolves_unmentioned_group_message(
+        self, monkeypatch, observation_limit, original, expected_quote
+    ):
+        adapter = self._gated(monkeypatch, LINE_OBSERVED_UNMENTIONED_MESSAGES=observation_limit,
+                              LINE_IGNORE_GROUP_MESSAGE_TYPES="image", LINE_REPLY_WITHOUT_MENTION_MEDIA_TYPES="image")
+        assert self._dispatch(adapter, _group(user_id="Ualice"), original, "original") is None
+        adapter._download_media.assert_not_awaited()
+
+        reply = _text("@Hermes what time?", [_bot_mention(0, 7)])
+        reply.update(id="m2", quotedMessageId=original["id"])
+        event = self._dispatch(adapter, _group(user_id="Ubob"), reply, "reply")
+        assert event.reply_to_message_id == original["id"]
+        assert event.reply_to_text == expected_quote
+        assert event.reply_to_is_own_message is False
+
     @pytest.mark.parametrize("source,webhook", [(_group(), "g-self"), (_room(), "r-self")])
     def test_is_self_mention_strips_span_and_dispatches(self, monkeypatch, source, webhook):
         adapter = self._gated(monkeypatch)

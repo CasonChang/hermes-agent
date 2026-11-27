@@ -156,6 +156,8 @@ display:
 
 When you quote a message in LINE, LINE sends Hermes only its `quotedMessageId`. To give the agent the quoted text as it would on Telegram, Hermes looks up that ID in the same chat. The gateway records messages it receives and sends in the shared local message index under `HERMES_HOME/state`. The index holds up to 1,000 entries across chats and stores the first 2,000 characters of each message. For media such as images, the quote contains a label such as `[image]`.
 
+In an allowed group or room, a member can @mention Hermes and quote another member’s earlier unmentioned message. This also works with `LINE_OBSERVED_UNMENTIONED_MESSAGES=0`. The usual mention and media rules still decide whether Hermes replies.
+
 ---
 
 ## Cron / notification delivery

@@ -913,19 +913,32 @@ class LineAdapter(BasePlatformAdapter):
         text = _inbound_message_text(msg, self._bot_user_id)
         gated = self._requires_mention_for_source(source)
         command = _gateway_slash_command(text) if gated else None
-        if self._ignored_group_message(event) or (gated and not self._message_bypasses_group_mention_gate(msg, command)):
+        skip_dispatch = self._ignored_group_message(event) or (
+            gated and not self._message_bypasses_group_mention_gate(msg, command))
+        context = ""
+        if skip_dispatch:
             if gated and self.observed_unmentioned_limit and not command:
                 self._observe_message(chat_type, chat_id, user_id, text)
+        else:
+            user_id = user_id or chat_id
+            if chat_id and reply_token:  # stash the reply token for outbound use
+                self._reply_tokens[chat_id] = (reply_token, time.time() + LINE_REPLY_TOKEN_TTL_SECONDS)
+            source_obj = self.build_source(
+                chat_id=chat_id, chat_type=chat_type, user_id=user_id, user_name=user_id, chat_name=chat_id,
+                message_id=message_id)
+            if gated and (history := self._observed_chats.get(chat_id)):
+                # Take the unread slice before index or media I/O can yield to later webhooks.
+                context = history.unread_context(self._source_session_key(source_obj), command)
+
+        quoted_id = msg.get("quotedMessageId")
+        quoted_text, quoted_own = None, False
+        if quoted_id:
+            quoted_text, quoted_own = await asyncio.to_thread(_lookup_quote, chat_id, quoted_id)
+        if message_id:
+            await asyncio.to_thread(_record_messages, chat_id, [(message_id, text)], own=False)
+        if skip_dispatch:
             return
-        user_id = user_id or chat_id
-        if chat_id and reply_token:  # stash the reply token for outbound use
-            self._reply_tokens[chat_id] = (reply_token, time.time() + LINE_REPLY_TOKEN_TTL_SECONDS)
-        source_obj = self.build_source(
-            chat_id=chat_id, chat_type=chat_type, user_id=user_id, user_name=user_id, chat_name=chat_id,
-            message_id=message_id)
-        if gated and (history := self._observed_chats.get(chat_id)):
-            # Take the session's unread slice before a media fetch can yield to later webhooks.
-            text = history.unread_context(self._source_session_key(source_obj), command) + text
+
         media_urls: list[str] = []
         media_types: list[str] = []
         if msg_type in _INBOUND_MEDIA_EXT:  # fetch, cache, surface a vision-friendly local path
@@ -935,14 +948,8 @@ class LineAdapter(BasePlatformAdapter):
                 media_urls, media_types = [local_path], [media_type]
         if chat_type == "dm" and self._client:  # best-effort typing indicator (DM only)
             asyncio.create_task(self._client.loading(chat_id))
-        quoted_id = msg.get("quotedMessageId")
-        quoted_text, quoted_own = None, False
-        if quoted_id:
-            quoted_text, quoted_own = await asyncio.to_thread(_lookup_quote, chat_id, quoted_id)
-        if message_id:
-            await asyncio.to_thread(_record_messages, chat_id, [(message_id, text)], own=False)
         await self.handle_message(MessageEvent(
-            text=text, message_type=_LINE_MESSAGE_TYPES.get(msg_type, MessageType.TEXT), source=source_obj,
+            text=context + text, message_type=_LINE_MESSAGE_TYPES.get(msg_type, MessageType.TEXT), source=source_obj,
             raw_message=event, message_id=message_id, media_urls=media_urls, media_types=media_types,
             reply_to_message_id=quoted_id, reply_to_text=quoted_text, reply_to_is_own_message=quoted_own))
 
