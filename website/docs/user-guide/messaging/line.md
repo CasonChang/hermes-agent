@@ -152,13 +152,19 @@ display:
 
 ---
 
+## Quoted replies
+
+When you quote a message in LINE, LINE sends Hermes only its `quotedMessageId`. To give the agent the quoted text as it would on Telegram, Hermes looks up that ID in the same chat. The gateway records messages it receives and sends in the shared local message index under `HERMES_HOME/state`. The index holds up to 1,000 entries across chats and stores the first 2,000 characters of each message. For media such as images, the quote contains a label such as `[image]`.
+
+---
+
 ## Cron / notification delivery
 
 ```env
 LINE_HOME_CHANNEL=Uxxxxxxxxxxxxxxxxxxxx     # default delivery target
 ```
 
-Cron jobs with `deliver: line` route to `LINE_HOME_CHANNEL`. The adapter ships a standalone Push-only sender so cron jobs work even when cron runs in a separate process from the gateway.
+Cron jobs with `deliver: line` route to `LINE_HOME_CHANNEL`. The adapter ships a standalone Push-only sender so cron jobs work even when cron runs in a separate process from the gateway. That sender records each delivered bubble in the same local index, so you can quote a scheduled message in a follow-up.
 
 ---
 
@@ -205,6 +211,7 @@ Cron jobs with `deliver: line` route to `LINE_HOME_CHANNEL`. The adapter ships a
 
 ## Limitations
 
+* **Older quotes.** LINE has no API to fetch a quoted message. Quotes from before the upgrade or after the original entry drops out of the index reach the agent without the quoted content.
 * **Bubble and length caps.** Each LINE text bubble is capped at 5000 characters. Longer responses are smart-chunked at ~4500 characters across up to 5 bubbles per Reply/Push call, splitting on natural boundaries where possible.
 * **No native message editing.** LINE has no edit-message API — streaming responses always send fresh bubbles, never edit prior ones.
 * **No Markdown rendering.** Bold (`**`), italics (`*`), code fences, and headings render as literal characters. The adapter strips them before sending; URLs are preserved (`[label](url)` becomes `label (url)`).
