@@ -139,6 +139,7 @@ with a name allows that one name only.
 | `tools.environments` | `BaseEnvironment` | prose in memory-provider / model-provider / terminal-environment plugin pages (tools.environments:BaseEnvironment is the package's `__all__` re-export) |
 | `utils` | `atomic_json_write` | prose in memory-provider / model-provider / terminal-environment plugin pages (tools.environments:BaseEnvironment is the package's `__all__` re-export) |
 | `utils` | `read_json_or_empty` | prose in memory-provider / model-provider / terminal-environment plugin pages (tools.environments:BaseEnvironment is the package's `__all__` re-export) |
+| `hermes_cli.commands` | `is_gateway_known_command` | adding-platform-adapters.md § Public helpers for platform plugins |
 | `gateway.rich_sent_store` | `record` | adding-platform-adapters.md § Public helpers for platform plugins |
 | `gateway.rich_sent_store` | `lookup` | adding-platform-adapters.md § Public helpers for platform plugins |
 | `gateway.rich_sent_store` | `record_marker` | adding-platform-adapters.md § Public helpers for platform plugins |

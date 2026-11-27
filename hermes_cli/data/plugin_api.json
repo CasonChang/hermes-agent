@@ -151,6 +151,7 @@
     {
       "source": "adding-platform-adapters.md § Public helpers for platform plugins",
       "entries": [
+        "hermes_cli.commands:is_gateway_known_command",
         "gateway.rich_sent_store:record",
         "gateway.rich_sent_store:lookup",
         "gateway.rich_sent_store:record_marker",
