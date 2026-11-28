@@ -325,6 +325,19 @@ async def connect(self) -> bool:
 `get_pending()` returns `None` once the clarify was answered, timed out or cleared, so compare the
 result by identity with the entry your card was rendered for before acting on a click.
 
+### Resolve a quoted message by ID
+
+For platforms such as LINE that supply only a quoted message ID, import `record`, `lookup`,
+`record_marker` and `lookup_marker` from `gateway.rich_sent_store`. Use a chat key of the form
+`<platform>:<chat_id>`. Call `record(chat_key, message_id, text)` when a message arrives or a
+send succeeds, then use `lookup(chat_key, message_id)` to recover its text when someone quotes it.
+The shared index keeps up to 1,000 entries per profile and 2,000 characters per message.
+
+Use `record_marker(chat_key, message_ids, key, value)` to tag each bubble of a send with a string,
+and `lookup_marker(chat_key, message_id, key)` to read it back. Storage is best-effort. A failed
+write raises no storage error, and lookups return `None` for missing text or markers. These
+helpers do file I/O, so call them via `asyncio.to_thread` from async handlers.
+
 ### Read a conversation's model settings
 
 `BasePlatformAdapter.get_session_model_settings(source)` is a synchronous, read-only
