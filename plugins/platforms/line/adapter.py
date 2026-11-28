@@ -1,6 +1,7 @@
 """LINE Messaging API adapter: aiohttp webhook (signature-verified) → BasePlatformAdapter.
 
 * Reply token preferred (free, single-use, ~60s TTL), metered Push as fallback.
+* Quoted replies resolve the original bubble from a chat-scoped local message index.
 * Slow-LLM postback button past ``slow_response_threshold`` (45s; 0 disables): the reply
   token is burned on a Template Buttons bubble; the tap yields a fresh free token that
   delivers the cached answer (PENDING → READY → DELIVERED, ERROR on cancel). Mid-turn
@@ -47,6 +48,7 @@ from gateway.platforms.base import (
 from gateway.platforms.helpers import MessageDeduplicator, cancel_task
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.config import Platform
+from gateway.rich_sent_store import lookup, lookup_marker, record, record_marker
 
 logger = logging.getLogger(__name__)
 
@@ -221,6 +223,48 @@ def _allowed_for_source(
     return bool(sid) and sid in {"dm": user_ids, "group": group_ids, "room": room_ids}[chat_type]
 
 
+def _store_key(chat_id: str) -> str:
+    return f"line:{chat_id}"
+
+
+def _record_messages(chat_id: str, entries: list[tuple[str, str]], *, own: bool) -> None:
+    key = _store_key(chat_id)
+    try:
+        for message_id, text in entries:
+            if not record(key, message_id, text):
+                logger.debug("LINE: could not index message %s in %s", message_id, chat_id)
+        if own:
+            record_marker(key, [message_id for message_id, _ in entries], "line_own", "1")
+    except Exception:
+        logger.debug("LINE: could not update message index for %s", chat_id, exc_info=True)
+
+
+def _lookup_quote(chat_id: str, quoted_id: str) -> tuple[Optional[str], bool]:
+    key = _store_key(chat_id)
+    try:
+        text = lookup(key, quoted_id)
+        if text:
+            return text, lookup_marker(key, quoted_id, "line_own") == "1"
+        logger.debug("LINE: quoted message %s is unavailable in the index for %s", quoted_id, chat_id)
+    except Exception:
+        logger.debug("LINE: could not look up quoted message %s in %s", quoted_id, chat_id, exc_info=True)
+    return None, False
+
+
+async def _record_sent_batch(chat_id: str, messages: list[dict[str, Any]], ids: list[str]) -> list[str]:
+    if not isinstance(ids, list) or not ids:
+        return []
+    entries = []
+    for message_id, msg in zip(ids, messages):
+        if not isinstance(msg, dict):
+            continue
+        kind = msg.get("type") or "message"
+        text = msg.get("text", msg.get("altText", f"[{kind}]"))
+        entries.append((message_id, text))
+    await asyncio.to_thread(_record_messages, chat_id, entries, own=True)
+    return ids
+
+
 class _LineClient:
     """Thin aiohttp wrapper around the LINE Messaging API (no ``line-bot-sdk`` dependency)."""
 
@@ -234,18 +278,33 @@ class _LineClient:
         import aiohttp
         return aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout), trust_env=gateway_trust_env())
 
-    async def _post_messages(self, url: str, label: str, payload: dict[str, Any]) -> None:
+    async def _post_messages(self, url: str, label: str, payload: dict[str, Any]) -> list[str]:
         async with self._session(self._timeout) as session:
             async with session.post(url, headers=self._headers, json=payload) as resp:
                 if resp.status >= 400:
                     body = await resp.text()
                     raise RuntimeError(f"LINE {label} {resp.status}: {body[:200]}")
+                try:
+                    response = json.loads(await resp.read())
+                except Exception:
+                    # LINE already accepted this batch. Retrying could duplicate it.
+                    logger.debug("LINE: unreadable %s response", label, exc_info=True)
+                    return []
+                sent = response.get("sentMessages") if isinstance(response, dict) else None
+                if not isinstance(sent, list):
+                    return []
+                ids = []
+                for entry in sent:
+                    if not isinstance(entry, dict) or not isinstance(entry.get("id"), (str, int)) or not entry["id"]:
+                        return []  # Skipping an entry would shift later IDs onto the wrong bubbles.
+                    ids.append(str(entry["id"]))
+                return ids
 
-    async def reply(self, reply_token: str, messages: list[dict[str, Any]]) -> None:
-        await self._post_messages(LINE_REPLY_URL, "reply", {"replyToken": reply_token, "messages": messages})
+    async def reply(self, reply_token: str, messages: list[dict[str, Any]]) -> list[str]:
+        return await self._post_messages(LINE_REPLY_URL, "reply", {"replyToken": reply_token, "messages": messages})
 
-    async def push(self, chat_id: str, messages: list[dict[str, Any]]) -> None:
-        await self._post_messages(LINE_PUSH_URL, "push", {"to": chat_id, "messages": messages})
+    async def push(self, chat_id: str, messages: list[dict[str, Any]]) -> list[str]:
+        return await self._post_messages(LINE_PUSH_URL, "push", {"to": chat_id, "messages": messages})
 
     async def loading(self, chat_id: str, seconds: int = 60) -> None:
         """Loading indicator (DM only). LINE rejects this for groups/rooms."""
@@ -570,9 +629,16 @@ class LineAdapter(BasePlatformAdapter):
         source_obj = self.build_source(
             chat_id=chat_id, chat_type=chat_type, user_id=user_id, user_name=user_id, chat_name=chat_id,
             message_id=message_id)
+        quoted_id = msg.get("quotedMessageId")
+        quoted_text, quoted_own = None, False
+        if quoted_id:
+            quoted_text, quoted_own = await asyncio.to_thread(_lookup_quote, chat_id, quoted_id)
+        if message_id:
+            await asyncio.to_thread(_record_messages, chat_id, [(message_id, text)], own=False)
         await self.handle_message(MessageEvent(
             text=text, message_type=_LINE_MESSAGE_TYPES.get(msg_type, MessageType.TEXT), source=source_obj,
-            raw_message=event, message_id=message_id, media_urls=media_urls, media_types=media_types))
+            raw_message=event, message_id=message_id, media_urls=media_urls, media_types=media_types,
+            reply_to_message_id=quoted_id, reply_to_text=quoted_text, reply_to_is_own_message=quoted_own))
 
     async def _handle_postback_event(self, event: dict[str, Any]) -> None:
         """User tapped the slow-LLM postback button — deliver the cached payload. READY replies (push
@@ -591,7 +657,8 @@ class LineAdapter(BasePlatformAdapter):
             entry = None
         if not self._client or not reply_token:
             return
-        if entry is None:
+        state = entry.state if entry is not None else None
+        if state is None:
             # The tap targets a button whose entry is gone (expired / lost with
             # process state). Tell the user instead of leaving the chat stuck,
             # and drop any mapping that still points at the dead request so
@@ -599,34 +666,31 @@ class LineAdapter(BasePlatformAdapter):
             if request_id and self._pending_buttons.get(chat_id) == request_id:
                 self._pending_buttons.pop(chat_id, None)
             messages = [_text_message(self.expired_text)]
-            try:
-                await self._client.reply(reply_token, messages)
-            except Exception as exc:
-                logger.debug("LINE: postback expired-notice reply failed: %s", exc)
-            return
-        state = entry.state
-        if state is State.READY:
+        elif state is State.READY:
             messages = _text_messages(str(entry.payload or ""))
         elif state is State.ERROR:
             messages = [_text_message(str(entry.payload or self.interrupted_text))]
         else:
             messages = [_text_message(self.delivered_text if state is State.DELIVERED else self.pending_text)]
         try:
-            await self._client.reply(reply_token, messages)
+            ids = await self._client.reply(reply_token, messages)
         except Exception as exc:
             if state is not State.READY:
                 if state is State.ERROR:
                     logger.warning("LINE: postback ERROR reply failed: %s", exc)
+                elif state is None:
+                    logger.debug("LINE: postback expired-notice reply failed: %s", exc)
                 return
             logger.warning("LINE: postback reply failed (%s); falling back to push", exc)
             try:
-                await self._client.push(chat_id, messages)
+                ids = await self._client.push(chat_id, messages)
             except Exception as exc2:
                 logger.error("LINE: postback push fallback failed: %s", exc2)
                 return
         if state in (State.READY, State.ERROR):
             self._cache.mark_delivered(request_id)
             self._pending_buttons.pop(chat_id, None)
+        await _record_sent_batch(chat_id, messages, ids)
 
     async def _download_media(
         self, message_id: str, msg_type: str, *, filename: Optional[str] = None) -> tuple[Optional[str], str]:
@@ -717,7 +781,8 @@ class LineAdapter(BasePlatformAdapter):
                 return
             msg = build_postback_button_message(self.pending_text, self.button_label, rid)
             try:
-                await self._client.reply(token, [msg])
+                ids = await self._client.reply(token, [msg])
+                await _record_sent_batch(chat_id, [msg], ids)
                 logger.info("LINE: sent slow-LLM postback button for chat %s (rid=%s)", chat_id, rid)
             except Exception as exc:
                 logger.warning("LINE: postback button send failed: %s", exc)
@@ -877,23 +942,27 @@ class LineAdapter(BasePlatformAdapter):
         batches = [messages[i:i + n] for i in range(0, len(messages), n)]
         token, used_reply = self._consume_reply_token(chat_id)
         start = 0
+        ids = []
+        message_id = None
         if used_reply and not force_push:
             try:
-                await self._client.reply(token, batches[0])
-                if text:
-                    return SendResult(success=True, message_id=token)
+                batch_ids = await self._client.reply(token, batches[0])
+                ids.extend(await _record_sent_batch(chat_id, batches[0], batch_ids))
+                # Progress edits rely on the reply token as message_id for text replies.
+                message_id = token if text else None
                 start = 1
             except Exception as exc:
                 logger.info("LINE: reply token rejected (%s); falling back to push", exc)
         for i in range(start, len(batches)):  # push the rest (reply token is single-use)
             try:
-                await self._client.push(chat_id, batches[i])
+                batch_ids = await self._client.push(chat_id, batches[i])
+                ids.extend(await _record_sent_batch(chat_id, batches[i], batch_ids))
             except Exception as exc:
                 shown = describe_proxy_error(exc, env_proxy_for_redaction(LINE_PUSH_URL, trust_env=gateway_trust_env())) or str(exc)  # the text may echo the proxy URL
                 if i > 0 or text:
                     logger.log(logging.WARNING if i > 0 else logging.ERROR, "LINE: push %s failed: %s", "for follow-up batch" if i > 0 else "send", shown)
                 return SendResult(success=False, error=shown)
-        return SendResult(success=True, message_id=None)
+        return SendResult(success=True, message_id=message_id, raw_response={"message_ids": ids} if ids else None)
 
 
 def _unlink_quietly(path: str) -> None:
@@ -948,10 +1017,14 @@ async def _standalone_send(
             t("platform.line.standalone.attachments_not_deliverable", count=str(len(media_files)))))
         messages = messages[:LINE_MAX_MESSAGES_PER_CALL]
     try:
-        await _LineClient(token).push(chat_id, messages)
-        return {"success": True, "message_id": None}
+        ids = await _LineClient(token).push(chat_id, messages)
     except Exception as exc:  # the text may echo the proxy URL: it reaches the model
         return send_error(describe_proxy_error(exc, env_proxy_for_redaction(LINE_PUSH_URL, trust_env=gateway_trust_env())) or str(exc))
+    sent_ids = await _record_sent_batch(chat_id, messages, ids)
+    result = {"success": True, "message_id": None}
+    if len(sent_ids) > 1:
+        result["delivered_message_ids"] = sent_ids
+    return result
 
 
 _SETUP_PROMPTS = (  # (env var, prompt, masked)

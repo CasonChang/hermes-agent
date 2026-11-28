@@ -213,6 +213,145 @@ class TestInboundMedia:
 
 
 # ---------------------------------------------------------------------------
+# Quoted reply context
+# ---------------------------------------------------------------------------
+
+class TestQuotedReplies:
+
+    @pytest.fixture
+    def adapter(self, monkeypatch, tmp_path):
+        from gateway.config import PlatformConfig
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        adapter = LineAdapter(PlatformConfig(enabled=True, extra={
+            "channel_access_token": "tok", "channel_secret": "sec",
+        }))
+        adapter._client = MagicMock()
+        adapter._client.reply = AsyncMock()
+        adapter._client.push = AsyncMock()
+        adapter.handle_message = AsyncMock()
+        return adapter
+
+    @staticmethod
+    def receive(adapter, message_id, *, chat="Cgroup", kind="text", **fields):
+        asyncio.run(adapter._handle_message_event({
+            "replyToken": "reply-token",
+            "source": {"type": "group", "groupId": chat, "userId": "Uuser"},
+            "message": {"type": kind, "id": message_id, **fields},
+        }))
+        return adapter.handle_message.await_args.args[0]
+
+    def test_quote_of_user_message_in_group(self, adapter):
+        self.receive(adapter, "first", text="Meet at the south entrance")
+        event = self.receive(adapter, "second", text="What time?", quotedMessageId="first")
+        assert event.reply_to_message_id == "first"
+        assert event.reply_to_text == "Meet at the south entrance"
+        assert event.reply_to_is_own_message is False
+
+    def test_quote_of_bot_reply_uses_text_as_sent(self, adapter):
+        self.receive(adapter, "first", text="Which entrance?")
+        adapter._client.reply.return_value = ["sent-1"]
+        result = asyncio.run(adapter.send("Cgroup", "The **south** entrance"))
+        assert result.success and result.message_id == "reply-token"
+        assert result.raw_response == {"message_ids": ["sent-1"]}
+        event = self.receive(adapter, "second", text="Here?", quotedMessageId="sent-1")
+        assert event.reply_to_text == "The south entrance"
+        assert event.reply_to_is_own_message is True
+
+    def test_each_pushed_bubble_has_its_own_id(self, adapter):
+        adapter._client.push.side_effect = [["1", "2", "3", "4", "5"], ["6"]]
+        bubbles = [
+            {"type": "text", "text": "First"}, {"type": "template", "altText": "Show answer"},
+            {"type": "image"}, {"type": "audio"}, {"type": "video"}, {"type": "sticker"},
+        ]
+        result = asyncio.run(adapter._send_messages("Cgroup", bubbles))
+        assert result.success and result.message_id is None
+        assert result.raw_response == {"message_ids": ["1", "2", "3", "4", "5", "6"]}
+        for i, body in enumerate(["First", "Show answer", "[image]", "[audio]", "[video]", "[sticker]"], 1):
+            event = self.receive(adapter, f"quote-{i}", text="This one", quotedMessageId=str(i))
+            assert event.reply_to_text == body
+            assert event.reply_to_is_own_message is True
+
+    def test_unknown_quote_has_only_the_id(self, adapter):
+        event = self.receive(adapter, "new", text="This one", quotedMessageId="old")
+        assert event.reply_to_message_id == "old"
+        assert event.reply_to_text is None
+        assert event.reply_to_is_own_message is False
+
+    @pytest.mark.parametrize("split", [False, True], ids=["single-bubble", "split-delivery"])
+    def test_quote_of_detached_cron_delivery(self, adapter, split):
+        greeting = "**Good morning!**"
+        ids = ["greeting"]
+        if split:
+            greeting = "x" * _line.LINE_SAFE_BUBBLE_CHARS + "\n\n" + greeting
+            ids = ["report", "greeting"]
+        with patch.object(_line._LineClient, "push", new=AsyncMock(return_value=ids)) as push:
+            result = asyncio.run(_standalone_send(adapter.config, "Cgroup", greeting))
+        assert push.await_args.args[1][-1] == {"type": "text", "text": "Good morning!"}
+        expected = {"success": True, "message_id": None}
+        if split:
+            expected["delivered_message_ids"] = ids
+        assert result == expected
+        event = self.receive(adapter, "reply", text="Thanks!", quotedMessageId="greeting")
+        assert event.reply_to_text == "Good morning!"
+        assert event.reply_to_is_own_message is True
+
+    def test_index_skips_malformed_bubble_without_shifting_ids(self, adapter):
+        adapter._client.push.return_value = ["bad", "good"]
+        result = asyncio.run(adapter._send_messages("Cgroup", [None, {"text": "Still indexed"}]))
+        assert result.success
+        assert self.receive(adapter, "first", text="?", quotedMessageId="bad").reply_to_text is None
+        assert self.receive(adapter, "second", text="?", quotedMessageId="good").reply_to_text == "Still indexed"
+
+    def test_quote_is_scoped_to_group(self, adapter):
+        self.receive(adapter, "a", chat="CA", text="Only for group A")
+        event = self.receive(adapter, "b", chat="CB", text="Which?", quotedMessageId="a")
+        assert event.reply_to_message_id == "a"
+        assert event.reply_to_text is None
+
+    def test_sticker_quotes_image_and_can_itself_be_quoted(self, adapter):
+        adapter._client.fetch_content = AsyncMock(return_value=b"image")
+        with patch.object(_line, "cache_image_from_bytes_async", new=AsyncMock(return_value="/cache/image.jpg")):
+            self.receive(adapter, "photo", kind="image")
+        sticker = self.receive(adapter, "smile", kind="sticker", keywords=["happy"], quotedMessageId="photo")
+        assert sticker.reply_to_text == "[image]"
+        event = self.receive(adapter, "last", text="Thanks", quotedMessageId="smile")
+        assert event.reply_to_text == "[sticker: happy]"
+
+    @pytest.mark.parametrize("fallback", [False, True], ids=["reply", "push-fallback"])
+    def test_quote_of_ready_postback_answer(self, adapter, fallback):
+        request_id = adapter._cache.register_pending("Cgroup")
+        adapter._cache.set_ready(request_id, "The **answer**")
+        if fallback:
+            adapter._client.reply.side_effect = RuntimeError("token expired")
+            adapter._client.push.return_value = ["answer"]
+        else:
+            adapter._client.reply.return_value = ["answer"]
+        asyncio.run(adapter._handle_postback_event({
+            "replyToken": "tap", "source": {"type": "group", "groupId": "Cgroup"},
+            "postback": {"data": json.dumps({"action": "show_response", "request_id": request_id})},
+        }))
+        event = self.receive(adapter, "question", text="Why?", quotedMessageId="answer")
+        assert event.reply_to_text == "The answer"
+        assert event.reply_to_is_own_message is True
+
+    @pytest.mark.parametrize(("body", "expected"), [
+        ('{"sentMessages":[{"id":"1","quoteToken":"q"},{"id":2}]}', ["1", "2"]),
+        ('{"sentMessages":[{},{"id":"2"}]}', []),
+        ("not JSON", []), ("", []), ("[]", []), ("{}", []),
+    ])
+    def test_line_client_reads_sent_ids(self, body, expected):
+        client = _line._LineClient("tok")
+        response = MagicMock(status=200)
+        response.read = AsyncMock(return_value=body.encode())
+        session = MagicMock()
+        session.post.return_value.__aenter__.return_value = response
+        with patch.object(client, "_session") as make_session:
+            make_session.return_value.__aenter__.return_value = session
+            assert asyncio.run(client.push("Cgroup", [{"type": "text", "text": "Hello"}])) == expected
+
+
+# ---------------------------------------------------------------------------
 # 8. Send routing (reply -> push fallback, batching, system-bypass)
 # ---------------------------------------------------------------------------
 
